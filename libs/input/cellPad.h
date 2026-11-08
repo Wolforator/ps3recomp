@@ -229,6 +229,13 @@ typedef struct CellPadHostInput {
 typedef int (*cellPad_host_input_fn)(void* user, int focused, CellPadHostInput* out);
 void cellPad_set_host_input(cellPad_host_input_fn fn, void* user);
 
+/* What the title asks of port 0's motors (cellPadSetActDirect), for a port
+ * whose player may have no pad with motors -- the touch screen, as a short
+ * vibration of the phone. small: on or off; large: 0-255. Called on the
+ * title's thread, every request (unchanged ones too). */
+typedef void (*cellPad_rumble_hook_fn)(u32 port, int small_on, int large);
+void cellPad_set_rumble_hook(cellPad_rumble_hook_fn fn);
+
 #ifdef __cplusplus
 }
 #endif

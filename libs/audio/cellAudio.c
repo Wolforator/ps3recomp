@@ -172,6 +172,10 @@ static unsigned long long g_audio_gaps, g_audio_gap_blocks;   /* AUDIO_GAPS tota
  * not read and the title is not notified, so its audio (music, a movie's
  * soundtrack) waits where it is; the device is fed silence. */
 volatile int g_audio_hold = 0;
+/* iOS: set after the audio session was interrupted (a call, Siri) or its
+ * route changed (headphones in or out): the mixer closes the output device
+ * and opens it again on the session as it is now, before it plays on. */
+volatile int g_audio_reopen = 0;
 
 #if defined(__APPLE__)
 #include <TargetConditionals.h>
@@ -835,6 +839,13 @@ static void* audio_mix_thread_func(void* arg)
                 printf("[cellAudio] device %s\n", stop ? "stopped (paused)" : "playing again");
             }
             if (stop) { usleep(20000); continue; }
+            if (__atomic_exchange_n(&g_audio_reopen, 0, __ATOMIC_ACQ_REL)) {
+                audio_backend_shutdown();
+                const int ok = audio_backend_init() == 0;
+                printf("[cellAudio] device reopened after an interruption or a route change: %s\n",
+                       ok ? "playing" : "failed, no sound");
+                if (!ok) { usleep(20000); continue; }
+            }
         }
 #endif
         if (s_sdl_audio_dev) {

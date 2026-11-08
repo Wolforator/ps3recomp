@@ -127,6 +127,9 @@ static void* s_host_input_user;
 static volatile int s_host_keyboard_last;   /* of the keyboard and the pad, the one touched last */
 static volatile int s_host_pad0;            /* a real pad is on port 0 */
 
+static cellPad_rumble_hook_fn s_rumble_hook;
+void cellPad_set_rumble_hook(cellPad_rumble_hook_fn fn) { s_rumble_hook = fn; }
+
 void cellPad_set_host_input(cellPad_host_input_fn fn, void* user)
 {
     s_host_input_user = user;
@@ -1711,6 +1714,10 @@ s32 cellPadSetActDirect(u32 port_no, CellPadActParam* param)
 
     if (port_no >= PAD_MAX_HOST_PORTS)
         return CELL_OK;
+
+    if (s_rumble_hook)
+        s_rumble_hook(port_no, param->motor[CELL_PAD_ACTUATOR_PARAM_SMALL] != 0,
+                      param->motor[CELL_PAD_ACTUATOR_PARAM_LARGE]);
 
     u16 lo, hi;
     pad_rumble_levels(param->motor[CELL_PAD_ACTUATOR_PARAM_SMALL],

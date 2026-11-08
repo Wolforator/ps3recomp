@@ -4675,6 +4675,19 @@ static void eng_archive_built(void)
         unlink(s_eng_arch_mark);
 }
 
+/* Set once the launch warm-up is over. A pipeline built after that which
+ * takes 2 ms or more was compiled for real in play -- one Metal's cache did
+ * not have (the variants built on first use, from functions the warm-up
+ * made, come from it in well under a millisecond). Each is logged with its
+ * time, the first 64 and then every 64th, so a second launch through the
+ * same scene shows none: the check that the caches (the pipeline list and
+ * the MSL beside it in Documents/cache, Metal's own cache) last between
+ * launches. */
+static int s_eng_warm_done;
+static u32 s_eng_play_compiles;
+static double s_eng_play_ms;
+#define ENG_PLAY_COMPILE_MS 2.0
+
 /* The pipeline state for pd: from the archive when it holds one (a lookup
  * that fails rather than compiles on a miss), else compiled and added. */
 static id<MTLRenderPipelineState> eng_pipeline_state(MTLRenderPipelineDescriptor* pd, NSError** err)
@@ -4699,9 +4712,16 @@ static id<MTLRenderPipelineState> eng_pipeline_state(MTLRenderPipelineDescriptor
     pso = [s_dev newRenderPipelineStateWithDescriptor:pd error:err];
     timespec_get(&t1, TIME_UTC);
     if (pso) { eng_archive_add(pd); eng_archive_built(); }
+    const double ms = (double)(t1.tv_sec - t0.tv_sec) * 1e3 + (double)(t1.tv_nsec - t0.tv_nsec) / 1e6;
     { static int log = -1; if (log < 0) log = getenv("RSX_PIPE_LOG") ? 1 : 0;
-      if (log) fprintf(stderr, "[rsx engine/metal] pipeline compiled in %.1f ms\n",
-                       (double)(t1.tv_sec - t0.tv_sec) * 1e3 + (double)(t1.tv_nsec - t0.tv_nsec) / 1e6); }
+      if (log) fprintf(stderr, "[rsx engine/metal] pipeline compiled in %.1f ms\n", ms); }
+    if (ms >= ENG_PLAY_COMPILE_MS && __atomic_load_n(&s_eng_warm_done, __ATOMIC_ACQUIRE)) {
+        const u32 k = __atomic_add_fetch(&s_eng_play_compiles, 1, __ATOMIC_RELAXED);
+        s_eng_play_ms += ms;   /* the log's figure only: a lost add is harmless */
+        if (k <= 64 || k % 64 == 0)
+            fprintf(stderr, "[rsx engine/metal] in play: a pipeline compiled in %.1f ms, not from a cache "
+                            "(%u since the warm-up, %.0f ms in all)\n", ms, k, s_eng_play_ms);
+    }
     return pso;
 }
 
@@ -4790,6 +4810,7 @@ static void eng_warmup_run(void)
             built, n, (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_nsec - t0.tv_nsec) / 1e9,
             s_eng_func_count - funcs0, s_eng_arch_hits - hits0, s_eng_arch_added - added0,
             no_msl, failed);
+    __atomic_store_n(&s_eng_warm_done, 1, __ATOMIC_RELEASE);
     free(list);
 }
 
@@ -4804,6 +4825,7 @@ static void eng_warmup_start(void)
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         eng_warmup_run();
         __atomic_store_n(&s_eng_warmup_running, 0, __ATOMIC_RELEASE);
+        __atomic_store_n(&s_eng_warm_done, 1, __ATOMIC_RELEASE);   /* also with no list yet */
     });
 }
 
