@@ -23,6 +23,7 @@
 #include "ps3emu/log_first.h"
 #ifdef __APPLE__
 #include <mach/mach_time.h>
+#include <unistd.h>   /* usleep: the precise sleep below */
 #endif
 #include "ps3emu/thread_name.h"
 
@@ -408,6 +409,37 @@ int64_t sys_timer_usleep(ppu_context* ctx)
         } while (qpc_now.QuadPart < qpc_deadline);
     }
 #else
+#ifdef __APPLE__
+    /* Darwin (macOS and iOS) wakes a timed sleep late on purpose -- timer
+     * coalescing, a leeway that grows with the sleep, whatever the thread's
+     * QoS: measured on an M2, usleep(16000) came back 3.1 ms late on average
+     * and usleep(25000) 3-4 ms (mach_wait_until and a timed condition wait
+     * the same). A title's frame limiter sleeps out most of its frame, so its
+     * cap became 28.2 fps for 30. From 4 ms up: to the deadline in steps --
+     * most of what is left (allowing for a quarter's lateness), 100 us sleeps
+     * near the end, the last 300 us spun -- which lands within a few us.
+     * Shorter sleeps are one plain sleep: a thread that polls with usleep(1000)
+     * (Drakengard 3's stream handler, ~5000 times a second) spent a third of a
+     * core spinning out their ends when this began at 1 ms, and a few hundred
+     * us late on a 1 ms poll matters to nobody.
+     * PS3RECOMP_PRECISE_SLEEP=0: one plain sleep always, as before. */
+    static int precise = -1;
+    if (precise < 0) { const char* e = getenv("PS3RECOMP_PRECISE_SLEEP"); precise = !(e && e[0] == '0'); }
+    if (precise && usec >= 4000 && usec <= 1000000) {
+        static mach_timebase_info_data_t tbi;
+        if (!tbi.denom) mach_timebase_info(&tbi);
+        const uint64_t start = mach_absolute_time();
+        const uint64_t span = usec * 1000ull * tbi.denom / tbi.numer;
+        for (;;) {
+            const uint64_t t = mach_absolute_time() - start;
+            if (t >= span) break;
+            const uint64_t left_us = (span - t) * tbi.numer / tbi.denom / 1000ull;
+            if (left_us > 1500) usleep((useconds_t)((left_us - 1000) * 4 / 5));
+            else if (left_us > 300) usleep(100);
+        }
+        return CELL_OK;
+    }
+#endif
     if (usec > 0) {
         struct timespec ts;
         ts.tv_sec  = (time_t)(usec / 1000000);

@@ -3702,15 +3702,63 @@ static const char* s_dump_tag = "";        /* file-name suffix for the dumps abo
 static int s_snap_stats = -1;
 static unsigned long s_snap_n, s_snap_noinval, s_inval_n[4], s_snap_unused;
 static u32 s_snap_last_surface = ~0u; static unsigned long s_inval_at_last_snap = ~0ul, s_inval_total;
+/* RSX_SNAP_REUSE: a draw that samples the target it writes reads a copy of
+ * it, and making one ends the pass, copies the whole target and starts a new
+ * pass that reloads it -- ~0.12 ms of GPU each on an M2, and Drakengard 3's
+ * fire and smoke (heat haze: each particle samples the scene at an offset)
+ * ask for 100-150 a frame. The console's texture unit reads such a target
+ * through its texture cache, which the title refreshes with an invalidation
+ * (0x1FD8); between two of them the cache may serve what it held. So:
+ *   0  a copy for every such draw, as before
+ *   1  a new copy only when the title invalidated the texture cache since
+ *      this target's last copy in this frame; otherwise the last copy.
+ *      Drakengard 3 invalidates before every one of them, so this saves
+ *      nothing there.
+ *   2  (default) one copy of each target per frame, at its first such draw:
+ *      a later particle then reads the scene without the particles drawn
+ *      before it. Checked on a 300-frame capture of the chapter 1 battle's
+ *      fire and smoke (tools/rsx_replay): 135 of 150 frames byte-identical,
+ *      the rest 8-290 pixels of 921600 off by at most 35 levels; copies
+ *      49.5 -> 1 a frame (150 -> 1 at the worst), passes 162 -> 60, GPU busy
+ *      18.9 -> 5.5 ms on an M2.
+ *   alternate  2 for 10 s, 0 for 10 s, and so on, saying when it switches:
+ *      a live before/after in the same scenes (diagnostics)
+ * RSX_SNAP_STATS counts the reuses as well. */
+static int s_snap_reuse = -1, s_snap_alt;
+int g_rsx_snap_reuse_off;   /* alternate: off now (RSX_PASS_PROF marks its frames) */
+static unsigned long s_snap_reused;
+static struct { u32 handle, snap, frame; unsigned long inval; } s_snap_cache[ENG_MAX_SURFACES];
+static int snap_reuse_mode(void)
+{
+    if (s_snap_reuse < 0) {
+        const char* e = getenv("RSX_SNAP_REUSE");
+        s_snap_alt = e && !strcmp(e, "alternate");
+        s_snap_reuse = s_snap_alt ? 2 : e && *e ? atoi(e) : 2;
+        if (s_snap_reuse) fprintf(stderr, "[rsx engine] RSX_SNAP_REUSE=%d: own-target copies %s\n", s_snap_reuse,
+                                  s_snap_reuse == 1 ? "reused until the title invalidates the texture cache"
+                                                    : "once per target per frame");
+    }
+    if (s_snap_alt) {
+        struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+        const int off = (int)((ts.tv_sec / 10) & 1);
+        if (off != g_rsx_snap_reuse_off) {
+            g_rsx_snap_reuse_off = off;
+            fprintf(stderr, "[rsx engine] RSX_SNAP_REUSE alternate: copies %s\n", off ? "PER DRAW (off)" : "once per frame (on)");
+        }
+        return off ? 0 : 2;
+    }
+    return s_snap_reuse;
+}
 static void snap_stats_frame(void)
 {
     static u32 last;
     if (g.frames - last < 300) return;
     last = g.frames;
     fprintf(stderr, "[snap-stats] 300 frames: %lu own-target copies (%lu with no texture-cache invalidation since the last), "
-            "%lu own-target units the program does not sample (no copy); invalidations arg1 %lu arg2 %lu arg3 %lu other %lu\n",
-            s_snap_n, s_snap_noinval, s_snap_unused, s_inval_n[1], s_inval_n[2], s_inval_n[3], s_inval_n[0]);
-    s_snap_n = s_snap_noinval = s_snap_unused = 0; s_inval_n[0] = s_inval_n[1] = s_inval_n[2] = s_inval_n[3] = 0;
+            "%lu own-target units the program does not sample (no copy); invalidations arg1 %lu arg2 %lu arg3 %lu other %lu; "
+            "%lu copies reused (RSX_SNAP_REUSE)\n",
+            s_snap_n, s_snap_noinval, s_snap_unused, s_inval_n[1], s_inval_n[2], s_inval_n[3], s_inval_n[0], s_snap_reused);
+    s_snap_n = s_snap_noinval = s_snap_unused = s_snap_reused = 0; s_inval_n[0] = s_inval_n[1] = s_inval_n[2] = s_inval_n[3] = 0;
 }
 static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                               u32 current_zslot,
@@ -3779,8 +3827,22 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                     s_snap_last_surface = i; s_inval_at_last_snap = s_inval_total;
                     snap_stats_frame();
                 }
-                const u32 snap = g.be->color_snapshot
-                    ? g.be->color_snapshot(g.be->user, g.surfaces[i].handle) : 0;
+                u32 snap = 0;
+                const int reuse = snap_reuse_mode();
+                if (reuse && i < ENG_MAX_SURFACES && s_snap_cache[i].snap &&
+                    s_snap_cache[i].handle == g.surfaces[i].handle && s_snap_cache[i].frame == g.frames &&
+                    (reuse == 2 || s_snap_cache[i].inval == s_inval_total)) {
+                    snap = s_snap_cache[i].snap;
+                    s_snap_reused++;
+                } else {
+                    snap = g.be->color_snapshot ? g.be->color_snapshot(g.be->user, g.surfaces[i].handle) : 0;
+                    if (reuse && i < ENG_MAX_SURFACES) {
+                        s_snap_cache[i].handle = g.surfaces[i].handle;
+                        s_snap_cache[i].snap = snap;
+                        s_snap_cache[i].frame = g.frames;
+                        s_snap_cache[i].inval = s_inval_total;
+                    }
+                }
                 if (snap) {
                     const u32 view = g.be->surface_view
                         ? g.be->surface_view(g.be->user, snap, t.remap & 0xFFFFu, t.format) : 0;
@@ -5144,7 +5206,10 @@ void rsx_draw_engine_method(u32 method, u32 arg)
      * (0xE9xx, 0xEBxx) encode the subchannel bits as part of the address;
      * preserve them with the wider mask. */
     u32 m = (method >= 0xE000u) ? (method & 0xFFFCu) : (method & 0x1FFCu);
-    if (m == 0x1FD8u && s_snap_stats > 0) { s_inval_n[arg < 4 ? arg : 0]++; s_inval_total++; }
+    if (m == 0x1FD8u) {   /* counted always: RSX_SNAP_REUSE keys on it */
+        s_inval_total++;
+        if (s_snap_stats > 0) s_inval_n[arg < 4 ? arg : 0]++;
+    }
     /* Recorded after the dispatch, behind the pages it read (rsx_capture.c),
      * and only when the capture was already running when it began. */
     const int cap = g_rsx_capture_on;

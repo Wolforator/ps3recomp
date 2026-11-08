@@ -2833,7 +2833,17 @@ typedef struct {
      * could not be made. */
     u8                           hdr_plane, plane_failed;
     id<MTLRenderPipelineState>   pso_plane[2];
+    /* RSX_PASS_PROF: target A's blend, as the guest set it (hardware
+     * blending, the pipeline's: sfactor/dfactor/equation are nv40 values) */
+    u8                           blend;
+    u16                          blend_sf, blend_df, blend_eq;
+    u64                          vs_h, ps_h;   /* the programs' HLSL hashes (their MSL cache files) */
+    id<MTLRenderPipelineState>   pso_flat;     /* RSX_PP_FLAT_BLENDED: a do-nothing fragment program */
+    u8                           zuse;         /* its draws test depth or stencil */
 } EngPipeline;
+/* RSX_PASS_PROF (below): a pass about to be encoded from rp, timed if the
+ * frame is */
+static void pp_pass(MTLRenderPassDescriptor* rp, const char* kind);
 static EngPipeline s_eng_pipe[ENG_MAX_PIPES];
 static u32 s_eng_pipe_count;
 
@@ -2989,6 +2999,7 @@ static float eng_sharpen(void)
 static NSString* const kEngHelperMSL = @
 "#include <metal_stdlib>\n"
 "using namespace metal;\n"
+"fragment float4 eng_flat_fs() { return float4(0.02, 0.01, 0.0, 0.05); }\n"   /* RSX_PP_FLAT_BLENDED */
 "struct BOut { float4 pos [[position]]; float2 uv; };\n"
 "vertex BOut eng_fullscreen_vs(uint vid [[vertex_id]]) {\n"
 "    float2 p = float2((vid << 1) & 2, vid & 2);\n"
@@ -3243,9 +3254,16 @@ static const char* kEngDepthColorMSL =
 "    return float4(float(eng_depth_round(src.read(uint2(i.pos.xy)), 16u)) / 65535.0, 0.0, 0.0, 1.0);\n"
 "}\n";
 
+static u32 s_pp_objs_added;   /* RSX_PASS_PROF: textures made since the last present */
+/* What an object is: 1 a depth snapshot (or depth as colour), 2 a copy of a
+ * colour target. RSX_PASS_PROF reports what a draw samples by it, and
+ * RSX_ZSNAP_POOL keeps a released depth snapshot's texture for the next. */
+static u8  s_pp_obj_kind[ENG_MAX_OBJECTS];
+static u32 s_pp_next_kind;   /* the kind the next eng_obj_add is */
 static u32 eng_obj_add(id<MTLTexture> t)
 {
     if (!t) return 0;
+    s_pp_objs_added++;
     u32 slot;
     if (s_eng_obj_free_count) {
         slot = s_eng_obj_free[--s_eng_obj_free_count];
@@ -3263,6 +3281,8 @@ static u32 eng_obj_add(id<MTLTexture> t)
         slot = s_eng_obj_count++;
     }
     s_eng_obj[slot] = t;
+    s_pp_obj_kind[slot] = (u8)s_pp_next_kind;
+    s_pp_next_kind = 0;
     s_eng_obj_gw[slot] = s_eng_obj_gh[slot] = 0;   /* a scaled creator sets them */
     s_eng_tgt_gw[slot] = s_eng_tgt_gh[slot] = 0;   /* a target creator sets them */
     s_eng_obj_mipped[slot] = 0;
@@ -3288,12 +3308,53 @@ static float eng_obj_fx(u32 handle)
 /* Recorded commands resolve numeric handles during encoding. Do not recycle
  * a released slot until those commands have acquired their Metal resources.
  * Submitted command buffers retain the objects for the GPU's remaining work. */
+/* RSX_ZSNAP_POOL (default 1; 0 off): a depth snapshot's texture -- one made
+ * each time a title samples a depth buffer it has drawn into since the last
+ * snapshot, about ten a frame in Drakengard 3's battles -- goes back to a
+ * pool when the engine lets go of the snapshot, and the next snapshot of the
+ * same size and format takes it rather than a new allocation. Reusing it
+ * right away is safe: command buffers on the one queue run in order, and
+ * Metal orders a later pass's writes after an earlier one's reads of a
+ * tracked texture. */
+#define ENG_ZSNAP_POOL 32
+static id<MTLTexture> s_zsnap_pool[ENG_ZSNAP_POOL];
+static u32 s_zsnap_pool_n;
+static u32 s_zsnap_new, s_zsnap_pooled;   /* since the last present (RSX_PASS_PROF) */
+static u32 s_ds_stores_saved, s_ds_zfb_saved;   /* RSX_STORE_DONTCARE / RSX_ZFALLBACK_DONTCARE hits, likewise */
+static int eng_zsnap_pool_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("RSX_ZSNAP_POOL"); on = e && *e ? atoi(e) != 0 : 1; }
+    return on;
+}
+static id<MTLTexture> eng_zsnap_texture(MTLTextureDescriptor* td)
+{
+    if (eng_zsnap_pool_on())
+        for (u32 i = 0; i < s_zsnap_pool_n; i++) {
+            id<MTLTexture> t = s_zsnap_pool[i];
+            if ([t width] == td.width && [t height] == td.height && [t pixelFormat] == td.pixelFormat &&
+                ([t usage] & td.usage) == td.usage) {
+                s_zsnap_pool[i] = s_zsnap_pool[--s_zsnap_pool_n];
+                s_zsnap_pool[s_zsnap_pool_n] = nil;
+                s_zsnap_pooled++;
+                return t;
+            }
+        }
+    s_zsnap_new++;
+    return [s_dev newTextureWithDescriptor:td];
+}
+
 static void eng_collect_retired_objects(void)
 {
     if (s_eng_rec_count) return;
     for (u32 i = 0; i < s_eng_obj_count; ++i) {
         if (!s_eng_obj_retired[i]) continue;
         s_eng_obj_retired[i] = 0;
+        /* a depth snapshot's own texture (not a view cut from one) */
+        if (s_pp_obj_kind[i] == 1 && s_eng_obj[i] && ![s_eng_obj[i] parentTexture] &&
+            eng_zsnap_pool_on() && s_zsnap_pool_n < ENG_ZSNAP_POOL)
+            s_zsnap_pool[s_zsnap_pool_n++] = s_eng_obj[i];
+        s_pp_obj_kind[i] = 0;
         s_eng_obj[i] = nil;
         s_eng_obj_free[s_eng_obj_free_count++] = i;
     }
@@ -3594,6 +3655,7 @@ static void eng_shutdown(void* user)
     for (u32 i = 0; i < s_eng_pipe_count; i++) {
         s_eng_pipe[i].pso = nil;
         s_eng_pipe[i].pso_scaled = nil;
+        s_eng_pipe[i].pso_flat = nil;
         s_eng_pipe[i].ds = nil;
         free(s_eng_pipe[i].ps_wpos);
         s_eng_pipe[i].ps_wpos = NULL;
@@ -3606,6 +3668,9 @@ static void eng_shutdown(void* user)
     for (u32 i = 0; i < s_eng_samp_count; i++) s_eng_samp[i].samp = nil;
     s_eng_obj_count = s_eng_obj_free_count = 0;
     memset(s_eng_obj_retired, 0, sizeof s_eng_obj_retired);
+    memset(s_pp_obj_kind, 0, sizeof s_pp_obj_kind);
+    for (u32 i = 0; i < s_zsnap_pool_n; i++) s_zsnap_pool[i] = nil;
+    s_zsnap_pool_n = 0;
     s_eng_pipe_count = s_eng_func_count = s_eng_samp_count = s_eng_view_count = 0;
     s_eng_rec_count = 0;
     s_eng_last_async_cb = nil;
@@ -3797,6 +3862,7 @@ static u32 eng_surface_view(void* user, u32 surface, u32 remap, u32 rsx_format)
             s_eng_view[i].format == rsx_format)
             return s_eng_view[i].view;
     if (s_eng_view_count >= ENG_MAX_VIEWS) return 0;
+    if (surface && surface <= ENG_MAX_OBJECTS) s_pp_next_kind = s_pp_obj_kind[surface - 1];   /* a view of a snapshot is one */
     const u32 handle = eng_obj_add(eng_make_view(t, remap, rsx_format));
     if (!handle) return 0;
     eng_obj_set_guest(handle, s_eng_obj_gw[surface - 1], s_eng_obj_gh[surface - 1]);
@@ -3856,6 +3922,7 @@ static u32 eng_color_snapshot(void* user, u32 surface)
                                                                width:[t width] height:[t height]
                                                            mipmapped:NO];
         td.usage = MTLTextureUsageShaderRead;
+        s_pp_next_kind = 2;   /* RSX_PASS_PROF: a colour target copy */
         dst = eng_obj_add([s_dev newTextureWithDescriptor:td]);
         if (!dst) return 0;
         if (slot == npool) { if (npool >= 32) return 0; npool++; }
@@ -3895,7 +3962,8 @@ static u32 eng_depth_snapshot(void* user, u32 depth, u32 w, u32 h)
                                                            width:(sw ? sw : 1) height:(sh ? sh : 1)
                                                        mipmapped:NO];
     td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
-    const u32 dst = eng_obj_add([s_dev newTextureWithDescriptor:td]);
+    s_pp_next_kind = 1;   /* a depth snapshot (RSX_PASS_PROF, RSX_ZSNAP_POOL) */
+    const u32 dst = eng_obj_add(eng_zsnap_texture(td));
     if (!dst) return 0;
     if (sw != w || sh != h) eng_obj_set_guest(dst, w, h);
 
@@ -3937,7 +4005,8 @@ static u32 eng_depth_snapshot_rgba8(void* user, u32 depth, u32 w, u32 h)
                                                            width:(sw ? sw : 1) height:(sh ? sh : 1)
                                                        mipmapped:NO];
     td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
-    const u32 dst = eng_obj_add([s_dev newTextureWithDescriptor:td]);
+    s_pp_next_kind = 1;   /* a depth snapshot (RSX_PASS_PROF, RSX_ZSNAP_POOL) */
+    const u32 dst = eng_obj_add(eng_zsnap_texture(td));
     if (!dst) return 0;
     if (sw != w || sh != h) eng_obj_set_guest(dst, w, h);
     EngRecord* r = &s_eng_rec[s_eng_rec_count++];
@@ -3992,7 +4061,8 @@ static u32 eng_depth_as_color(void* user, u32 depth, u32 w, u32 h, u32 rsx_fmt)
     td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead |
                MTLTextureUsagePixelFormatView;
     td.storageMode = MTLStorageModePrivate;
-    const u32 dst = eng_obj_add([s_dev newTextureWithDescriptor:td]);
+    s_pp_next_kind = 1;   /* a depth snapshot (RSX_PASS_PROF, RSX_ZSNAP_POOL) */
+    const u32 dst = eng_obj_add(eng_zsnap_texture(td));
     if (!dst) return 0;
     if (sw != w || sh != h) eng_obj_set_guest(dst, w, h);
 
@@ -4794,6 +4864,13 @@ static u32 eng_pipeline_create_locked(void* user, const char* vs_hlsl, const cha
     np.pd = pd;
     for (int a = 0; a < 2; a++) for (int b = 0; b < 3; b++) np.pso_ms[a][b] = nil;
     np.hdr_plane = strstr(ps_hlsl, "rsx_hdr_plane") != NULL;
+    np.blend    = rs->blend_enable != 0;
+    np.zuse     = rs->depth_test || rs->stencil_enable;
+    np.vs_h     = fnv1a64(vs_hlsl, (u32)strlen(vs_hlsl), 1469598103934665603ull);
+    np.ps_h     = fnv1a64(ps_hlsl, (u32)strlen(ps_hlsl), 1469598103934665603ull);
+    np.blend_sf = (u16)rs->sf_rgb;
+    np.blend_df = (u16)rs->df_rgb;
+    np.blend_eq = (u16)rs->eq_rgb;
     np.zwrite = (rs->depth_test && rs->depth_write) ||
                 (rs->stencil_enable && (rs->s_write_mask & 0xFFu));
     /* CULL_FACE FRONT=0x0404 BACK=0x0405 FRONT_AND_BACK=0x0408 (front here,
@@ -5474,6 +5551,7 @@ static void eng_encode_clear_rect(id<MTLCommandBuffer> cb, const EngRecord* r)
     rp.stencilAttachment.storeAction = MTLStoreActionStore;
     rp.renderTargetWidth  = tw;
     rp.renderTargetHeight = th;
+    pp_pass(rp, "clrrect");
     id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp];
     if (!e) return;
     [e setRenderPipelineState:s_eng_zclear_pso];
@@ -5503,6 +5581,7 @@ static void eng_encode_clear_rect(id<MTLCommandBuffer> cb, const EngRecord* r)
     if (!*slot) { s_eng_twin_stale[r->depth - 1] = 1; return; }
     rp.depthAttachment.texture   = tw2;
     rp.stencilAttachment.texture = tw2;
+    pp_pass(rp, "clrrect");
     id<MTLRenderCommandEncoder> e2 = [cb renderCommandEncoderWithDescriptor:rp];
     if (!e2) { s_eng_twin_stale[r->depth - 1] = 1; return; }
     [e2 setRenderPipelineState:*slot];
@@ -5559,6 +5638,7 @@ static void eng_encode_clear_color_rect(id<MTLCommandBuffer> cb, const EngRecord
     rp.colorAttachments[0].texture     = t;
     rp.colorAttachments[0].loadAction  = MTLLoadActionLoad;
     rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    pp_pass(rp, "clrrect");
     id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp];
     if (!e) return;
     [e setRenderPipelineState:pso];
@@ -5569,6 +5649,49 @@ static void eng_encode_clear_color_rect(id<MTLCommandBuffer> cb, const EngRecord
 }
 
 /* ---- replay -------------------------------------------------------------- */
+
+/* RSX_PP_FLAT_BLENDED (diagnostics; the picture is wrong while it is on):
+ * every blended draw gets a fragment program that does nothing but write a
+ * faint constant -- the same vertices, rasterisation and blending, none of
+ * the shading. What a pass's time keeps with it on is the fill and the
+ * blend (overdraw); what it loses was its programs. 1 on throughout;
+ * "alternate" on for 10 s, off for 10 s, so one run compares the two in the
+ * same scenes. RSX_PASS_PROF's frame lines say which it was. */
+static int s_pp_flat_mode = -1;   /* 0 off, 1 on, 2 alternate */
+static int pp_flat_now(void)
+{
+    if (s_pp_flat_mode < 0) {
+        const char* e = getenv("RSX_PP_FLAT_BLENDED");
+        s_pp_flat_mode = !e || !*e || *e == '0' ? 0 : !strcmp(e, "alternate") ? 2 : 1;
+    }
+    if (s_pp_flat_mode < 2) return s_pp_flat_mode;
+    static int last = -1;
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    const int on = (int)((ts.tv_sec / 10) & 1);
+    if (on != last) {
+        last = on;
+        fprintf(stderr, "[pass-prof] flat fragment programs for blended draws: %s\n", on ? "ON" : "off");
+    }
+    return on;
+}
+static id<MTLRenderPipelineState> pp_pipe_flat(u32 idx)
+{
+    EngPipeline* p = &s_eng_pipe[idx];
+    if (p->pso_flat) return p->pso_flat;
+    static id<MTLFunction> fn;
+    if (!fn && s_eng_helper_lib) fn = [s_eng_helper_lib newFunctionWithName:@"eng_flat_fs"];
+    if (!fn || !p->pd) return nil;
+    MTLRenderPipelineDescriptor* pd = [p->pd copy];
+    pd.fragmentFunction = fn;
+    pd.binaryArchives = @[];
+    NSError* err = nil;
+    p->pso_flat = [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+    if (!p->pso_flat) {
+        static int said;
+        if (!said++) fprintf(stderr, "[pass-prof] flat pipeline failed: %s\n", [[err localizedDescription] UTF8String]);
+    }
+    return p->pso_flat;
+}
 
 static void eng_encode_draw(id<MTLRenderCommandEncoder> enc, const EngRecord* r,
                             id<MTLBuffer> stage, float pf)
@@ -5583,6 +5706,10 @@ static void eng_encode_draw(id<MTLRenderCommandEncoder> enc, const EngRecord* r,
     id<MTLRenderPipelineState> ps = use_scaled ? p->pso_scaled : p->pso;
     if (s_eng_pass_samples > 1) ps = eng_pipe_ms(r->pipeline - 1, use_scaled);
     else if (s_eng_pass_plane) ps = eng_pipe_plane(r->pipeline - 1, use_scaled);
+    else if (p->blend && pp_flat_now()) {
+        id<MTLRenderPipelineState> f = pp_pipe_flat(r->pipeline - 1);
+        if (f) ps = f;
+    }
     if (!ps) return;
     [enc setRenderPipelineState:ps];
     [enc setDepthStencilState:p->ds];
@@ -5669,11 +5796,519 @@ static id<MTLTexture> eng_fallback_depth(id<MTLTexture> rt0)
     return s_eng_zfallback;
 }
 
+/* ---- RSX_PASS_PROF: the GPU's time per pass --------------------------------
+ *
+ * RSX_PASS_PROF=<n>: every n-th present (60 when n is not a number), every
+ * render pass of that frame -- the engine's draw passes, the clears, depth
+ * snapshots, the FXAA and the composite to the screen -- and every blit is
+ * timed on the GPU with a counter sample buffer: timestamps at the start and
+ * end of its vertex and fragment stages (MTLCounterSamplingPointAtStage-
+ * Boundary, the one point a tile-based Apple GPU samples). When the frame has
+ * run, the log gets the ten passes that took the longest:
+ *
+ *   [pass-prof] frame <n>: GPU busy <ms> (the union of every stage's
+ *               interval: the GPU's real occupancy), and other sums
+ *   [pass-prof] frame <n>: <passes> passes, draws, loads/stores, the bytes
+ *               they move, depth snapshots, copies, textures made
+ *   [pass-prof]  #<k> <kind> <w>x<h> <format> rt<n> msaa<n>: frag <ms>
+ *               vert <ms>, <draws> draws (<b> blended: <sf>/<df> eq <eq>),
+ *               load C/Z/S <c|l|d> store C/Z/S <s|d|r>
+ *
+ * The stages of neighbouring passes overlap on a tile-based GPU (the vertex
+ * stage of one under the fragment stage of the one before), so the times add
+ * up to more than the frame; what they rank is right. Load/store letters:
+ * c clear, l load, d don't care; s store, r MSAA resolve. Blending in this
+ * backend is always the hardware's (the pipeline's blend state), never a read
+ * of the target in the shader; sf/df/eq are the guest's nv40 values
+ * (0x0302 SRC_ALPHA, 0x0303 ONE_MINUS_SRC_ALPHA, 0x0001 ONE, 0x8006 ADD).
+ * A pass whose fragment stage took RSX_PASS_PROF_DETAIL_MS (1.5) or more is
+ * broken down by pipeline: its programs' MSL cache files (cache/msl/fp_<key>
+ * .msl, vp_<key>.msl), draws, vertices, textures, and whether a draw samples
+ * a depth snapshot or a copy of a target. */
+extern uint32_t g_rsx_engine_frame;   /* rsx_draw_engine.c: the present count */
+#define PP_MAX_PASSES 1000
+typedef struct {
+    char   kind[10];
+    u32    w, h, fmt, nrt, msn;
+    u32    draws, blended, sf, df, eq;
+    char   load[4], store[4];   /* colour 0, depth, stencil: one letter each */
+    double vert_ms, frag_ms, span_ms;
+    double v0, v1, f0, f1;      /* the stages' intervals, host ns (0: none) */
+    /* its draws by pipeline (the first 6): how many, vertices, textures
+     * bound, and whether any samples a depth snapshot or a target copy */
+    struct { u32 pipe, n, verts, ntex; u8 zsnap, csnap; } by[6];
+    u32 nby;
+} PPass;
+typedef struct {
+    id<MTLCounterSampleBuffer> buf;
+    PPass  pass[PP_MAX_PASSES];
+    u32    n, overflow;
+    uint64_t cpu0, gpu0;   /* a CPU/GPU timestamp pair taken as it was encoded */
+    int flat;              /* RSX_PP_FLAT_BLENDED was on for it */
+    int snap_off;          /* RSX_SNAP_REUSE=alternate had it off */
+} PPCb;
+static int      s_pp_every = -1;
+static id<MTLCounterSet> s_pp_set;
+static u32      s_pp_frame = 0xFFFFFFFFu;   /* the present count being profiled */
+static PPCb*    s_pp_cb;                    /* the command buffer being encoded, profiled */
+static PPass*   s_pp_cur;                   /* the pass being encoded */
+/* The frame's totals, from its command buffers as they complete (one queue:
+ * in order; the present's is the last). */
+static os_unfair_lock s_pp_lk = OS_UNFAIR_LOCK_INIT;
+static PPass   s_pp_all[PP_MAX_PASSES * 2];
+static u32     s_pp_all_n, s_pp_cbs, s_pp_overflow;
+static double  s_pp_cb_ms;
+static u32     s_pp_rejected;   /* stage samples outside their command buffer's run */
+
+/* How long anything of the frame was running on the GPU: the union of every
+ * pass's stage intervals. Neighbouring passes overlap on a tile-based GPU,
+ * and a command buffer's start-to-end includes its waits, so neither a sum
+ * nor that is the GPU's busy time; this is. */
+static int pp_dcmp(const void* a, const void* b)
+{
+    const double x = ((const double*)a)[0], y = ((const double*)b)[0];
+    return x < y ? -1 : x > y ? 1 : 0;
+}
+static double pp_busy_ms(const PPass* p, u32 n)
+{
+    double* iv = (double*)malloc(sizeof(double) * 4 * n);
+    if (!iv) return 0;
+    u32 m = 0;
+    for (u32 k = 0; k < n; k++) {
+        if (p[k].v1 > p[k].v0) { iv[2*m] = p[k].v0; iv[2*m+1] = p[k].v1; m++; }
+        if (p[k].f1 > p[k].f0) { iv[2*m] = p[k].f0; iv[2*m+1] = p[k].f1; m++; }
+    }
+    qsort(iv, m, 2 * sizeof(double), pp_dcmp);
+    double busy = 0, s0 = 0, s1 = -1;
+    for (u32 k = 0; k < m; k++) {
+        if (iv[2*k] > s1) { if (s1 > s0) busy += s1 - s0; s0 = iv[2*k]; s1 = iv[2*k+1]; }
+        else if (iv[2*k+1] > s1) s1 = iv[2*k+1];
+    }
+    if (s1 > s0) busy += s1 - s0;
+    free(iv);
+    return busy / 1e6;
+}
+static u32     s_pp_snapshots, s_pp_copies;
+
+static int pp_every(void)
+{
+    if (s_pp_every >= 0) return s_pp_every;
+    const char* e = getenv("RSX_PASS_PROF");
+    s_pp_every = 0;
+    if (e && *e && *e != '0') {
+        s_pp_every = atoi(e) > 0 ? atoi(e) : 60;
+        if (@available(macOS 11.0, iOS 14.0, *)) {
+            if ([s_dev supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary])
+                for (id<MTLCounterSet> cs in s_dev.counterSets)
+                    if ([cs.name isEqualToString:MTLCommonCounterSetTimestamp]) s_pp_set = cs;
+        }
+        if (!s_pp_set) {
+            fprintf(stderr, "[pass-prof] this GPU has no stage-boundary timestamps; off\n");
+            s_pp_every = 0;
+        } else {
+            fprintf(stderr, "[pass-prof] on: every %d presents, the 10 costliest passes\n", s_pp_every);
+        }
+    }
+    return s_pp_every;
+}
+
+/* At the start of each command buffer's encoding: is it in a profiled frame? */
+static void pp_cb_begin(void)
+{
+    s_pp_cb = NULL; s_pp_cur = NULL;
+    if (!pp_every()) return;
+    const u32 f = g_rsx_engine_frame;
+    if (f % (u32)s_pp_every != 0 && f != s_pp_frame) return;
+    if (s_pp_frame != f) s_pp_frame = f;
+    if (@available(macOS 11.0, iOS 14.0, *)) {
+        /* A few buffers made once and taken in turn: a frame is a handful
+         * of command buffers and the next profiled one is n presents away,
+         * and a device hands out only so many sample buffers. */
+        static id<MTLCounterSampleBuffer> pool[4];
+        static u32 next;
+        id<MTLCounterSampleBuffer> b = pool[next % 4];
+        if (!b) {
+            MTLCounterSampleBufferDescriptor* d = [MTLCounterSampleBufferDescriptor new];
+            d.counterSet  = s_pp_set;
+            d.storageMode = MTLStorageModeShared;
+            d.sampleCount = PP_MAX_PASSES * 4;
+            NSError* err = nil;
+            b = pool[next % 4] = [s_dev newCounterSampleBufferWithDescriptor:d error:&err];
+            if (!b) {
+                static int said;
+                if (!said++) fprintf(stderr, "[pass-prof] no sample buffer: %s\n", [[err localizedDescription] UTF8String]);
+                return;
+            }
+        }
+        next++;
+        PPCb* c = (PPCb*)calloc(1, sizeof *c);
+        if (!c) return;
+        c->buf = b;
+        c->flat = s_pp_flat_mode > 0 ? pp_flat_now() : 0;
+        { extern int g_rsx_snap_reuse_off; c->snap_off = g_rsx_snap_reuse_off; }
+        [s_dev sampleTimestamps:&c->cpu0 gpuTimestamp:&c->gpu0];
+        s_pp_cb = c;
+    }
+}
+
+static char pp_load(MTLLoadAction a) { return a == MTLLoadActionClear ? 'c' : a == MTLLoadActionLoad ? 'l' : 'd'; }
+static char pp_store(MTLStoreAction a)
+{
+    return a == MTLStoreActionStore ? 's' : a == MTLStoreActionDontCare ? 'd'
+         : a == MTLStoreActionMultisampleResolve ? 'r' : a == MTLStoreActionStoreAndMultisampleResolve ? 'R' : '?';
+}
+
+/* A render pass about to be made from rp: timed, if the frame is. */
+static void pp_pass(MTLRenderPassDescriptor* rp, const char* kind)
+{
+    s_pp_cur = NULL;
+    PPCb* c = s_pp_cb;
+    if (!c) return;
+    if (c->n >= PP_MAX_PASSES) { c->overflow++; return; }
+    if (@available(macOS 11.0, iOS 14.0, *)) {
+        const u32 k = c->n++;
+        PPass* p = &c->pass[k];
+        memset(p, 0, sizeof *p);
+        snprintf(p->kind, sizeof p->kind, "%s", kind);
+        id<MTLTexture> t0 = rp.colorAttachments[0].texture;
+        id<MTLTexture> tz = rp.depthAttachment.texture;
+        id<MTLTexture> t = t0 ? t0 : tz;
+        if (t) { p->w = (u32)[t width]; p->h = (u32)[t height]; p->fmt = (u32)[t pixelFormat]; p->msn = (u32)[t sampleCount]; }
+        for (u32 a = 0; a < 8; a++) if (rp.colorAttachments[a].texture) p->nrt = a + 1;
+        p->load[0]  = t0 ? pp_load(rp.colorAttachments[0].loadAction) : '-';
+        p->store[0] = t0 ? pp_store(rp.colorAttachments[0].storeAction) : '-';
+        p->load[1]  = tz ? pp_load(rp.depthAttachment.loadAction) : '-';
+        p->store[1] = tz ? pp_store(rp.depthAttachment.storeAction) : '-';
+        p->load[2]  = rp.stencilAttachment.texture ? pp_load(rp.stencilAttachment.loadAction) : '-';
+        p->store[2] = rp.stencilAttachment.texture ? pp_store(rp.stencilAttachment.storeAction) : '-';
+        MTLRenderPassSampleBufferAttachmentDescriptor* sa = rp.sampleBufferAttachments[0];
+        sa.sampleBuffer = c->buf;
+        sa.startOfVertexSampleIndex   = k * 4 + 0;
+        sa.endOfVertexSampleIndex     = k * 4 + 1;
+        sa.startOfFragmentSampleIndex = k * 4 + 2;
+        sa.endOfFragmentSampleIndex   = k * 4 + 3;
+        s_pp_cur = p;
+        if (!strcmp(kind, "zsnap")) s_pp_snapshots++;
+    }
+}
+
+/* A draw encoded into the current pass. */
+static void pp_draw(const EngRecord* r)
+{
+    PPass* p = s_pp_cur;
+    if (!p) return;
+    const u32 pipeline = r->pipeline;
+    p->draws++;
+    {
+        u32 k = 0;
+        while (k < p->nby && p->by[k].pipe != pipeline) k++;
+        if (k == p->nby && p->nby < 6) { memset(&p->by[k], 0, sizeof p->by[k]); p->by[k].pipe = pipeline; p->nby++; }
+        if (k < p->nby) {
+            p->by[k].n++;
+            p->by[k].verts += r->index_count ? r->index_count : r->vertex_count;
+            u32 nt = 0;
+            for (u32 u = 0; u < RSX_BE_MAX_TEXTURES; u++) {
+                const u32 h = r->tex[u];
+                if (!h || h > ENG_MAX_OBJECTS || !eng_obj(h)) continue;
+                nt++;
+                if (s_pp_obj_kind[h - 1] == 1) p->by[k].zsnap = 1;
+                if (s_pp_obj_kind[h - 1] == 2) p->by[k].csnap = 1;
+            }
+            if (nt > p->by[k].ntex) p->by[k].ntex = nt;
+        }
+    }
+    if (pipeline && pipeline <= ENG_MAX_PIPES && s_eng_pipe[pipeline - 1].blend) {
+        const EngPipeline* e = &s_eng_pipe[pipeline - 1];
+        p->blended++;
+        p->sf = e->blend_sf; p->df = e->blend_df; p->eq = e->blend_eq;
+    }
+}
+
+/* A blit encoder, timed when the frame is (its two samples go in the
+ * vertex slots; it has no fragment stage). */
+static id<MTLBlitCommandEncoder> pp_blit(id<MTLCommandBuffer> cb, id<MTLTexture> dst)
+{
+    PPCb* c = s_pp_cb;
+    if (!c || c->n >= PP_MAX_PASSES) return [cb blitCommandEncoder];
+    if (@available(macOS 11.0, iOS 14.0, *)) {
+        const u32 k = c->n++;
+        PPass* p = &c->pass[k];
+        memset(p, 0, sizeof *p);
+        snprintf(p->kind, sizeof p->kind, "copy");
+        if (dst) { p->w = (u32)[dst width]; p->h = (u32)[dst height]; p->fmt = (u32)[dst pixelFormat]; }
+        strcpy(p->load, "---"); strcpy(p->store, "---");
+        MTLBlitPassDescriptor* bp = [MTLBlitPassDescriptor blitPassDescriptor];
+        bp.sampleBufferAttachments[0].sampleBuffer = c->buf;
+        bp.sampleBufferAttachments[0].startOfEncoderSampleIndex = k * 4 + 0;
+        bp.sampleBufferAttachments[0].endOfEncoderSampleIndex   = k * 4 + 1;
+        s_pp_copies++;
+        return [cb blitCommandEncoderWithDescriptor:bp];
+    }
+    return [cb blitCommandEncoder];
+}
+
+/* The MSL cache file's key for a program (eng_msl_cache_path's). */
+static u64 pp_msl_key(u64 hash, int stage)
+{
+    const char* tag = getenv("PS3RECOMP_MSL_FAST") ? "msl-f3" : "msl-v3";
+    return fnv1a64(tag, 6, hash ^ (u64)(stage + 1) * 0x9E3779B97F4A7C15ull);
+}
+
+static int pp_cmp(const void* a, const void* b)
+{
+    /* by the time its stages ran: the span can include a wait between them */
+    const double x = ((const PPass*)a)->frag_ms + ((const PPass*)a)->vert_ms;
+    const double y = ((const PPass*)b)->frag_ms + ((const PPass*)b)->vert_ms;
+    return x < y ? 1 : x > y ? -1 : 0;
+}
+
+/* Bytes a pass moves between tile memory and RAM: each load and store of a
+ * whole attachment (RGBA8-sized colour, 5-byte depth/stencil). An estimate. */
+static double pp_traffic_mb(const PPass* p)
+{
+    const double px = (double)p->w * p->h, c = px * 4.0 * (p->nrt ? p->nrt : 1), z = px * 5.0;
+    double b = 0;
+    if (p->load[0] == 'l') b += c;
+    if (p->store[0] == 's' || p->store[0] == 'R') b += c;
+    if (p->load[1] == 'l') b += z;
+    if (p->store[1] == 's' || p->store[1] == 'R') b += z;
+    return b / (1024.0 * 1024.0);
+}
+
+/* At the end of the command buffer's encoding: its samples are read when it
+ * has run; the present's prints the frame. */
+static void pp_cb_end(id<MTLCommandBuffer> cb, int present)
+{
+    PPCb* c = s_pp_cb;
+    s_pp_cb = NULL; s_pp_cur = NULL;
+    /* textures made while the frame was recorded: counted from present to present */
+    const u32 made = s_pp_objs_added, zs_new = s_zsnap_new, zs_pooled = s_zsnap_pooled;
+    const u32 st_saved = s_ds_stores_saved, zfb_saved = s_ds_zfb_saved;
+    if (present) s_pp_objs_added = s_zsnap_new = s_zsnap_pooled = s_ds_stores_saved = s_ds_zfb_saved = 0;
+    if (!c) return;
+    const u32 frame = s_pp_frame;
+    if (present) s_pp_frame = 0xFFFFFFFFu;
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+        if (@available(macOS 11.0, iOS 14.0, *)) {
+            uint64_t cpu1 = 0, gpu1 = 0;
+            [s_dev sampleTimestamps:&cpu1 gpuTimestamp:&gpu1];
+            /* GPU ticks to the host's ns: the two clocks' advance over the
+             * same span. sampleTimestamps' CPU side is in ns here, on the
+             * clock GPUStartTime reads in seconds (measured on an M2: the
+             * GPU's ticks are those ns too, so the ratio comes out 1). */
+            const double cpu_ns = (double)(cpu1 - c->cpu0);
+            const double ns_per_tick = gpu1 > c->gpu0 ? cpu_ns / (double)(gpu1 - c->gpu0) : 1.0;
+            const double cpu0_ns = (double)c->cpu0;
+            /* A GPU timestamp on the host's clock (ns), and the window the
+             * command buffer ran in on it (GPUStartTime/GPUEndTime: seconds
+             * of the same clock). A stage that says it began before its
+             * command buffer did is a sample that cannot be right (seen on
+             * the Mac: vertex starts hundreds of ms early) -- not counted. */
+            #define PP_HOST(g) (cpu0_ns + ((double)(int64_t)((g) - c->gpu0)) * ns_per_tick)
+            const double w0 = [done GPUStartTime] * 1e9 - 200e3, w1 = [done GPUEndTime] * 1e9 + 200e3;
+            NSData* d = c->n ? [c->buf resolveCounterRange:NSMakeRange(0, c->n * 4)] : nil;
+            const MTLCounterResultTimestamp* ts = d ? (const MTLCounterResultTimestamp*)d.bytes : NULL;
+            const uint64_t bad = MTLCounterErrorValue;
+            os_unfair_lock_lock(&s_pp_lk);
+            for (u32 k = 0; k < c->n && ts; k++) {
+                PPass* p = &c->pass[k];
+                const uint64_t vs = ts[k*4].timestamp, ve = ts[k*4+1].timestamp;
+                const uint64_t fs = ts[k*4+2].timestamp, fe = ts[k*4+3].timestamp;
+                int v_ok = vs != bad && ve != bad && vs && ve >= vs;
+                int f_ok = fs != bad && fe != bad && fs && fe >= fs;
+                p->v0 = v_ok ? PP_HOST(vs) : 0; p->v1 = v_ok ? PP_HOST(ve) : 0;
+                p->f0 = f_ok ? PP_HOST(fs) : 0; p->f1 = f_ok ? PP_HOST(fe) : 0;
+                if (v_ok && (p->v0 < w0 || p->v1 > w1)) { v_ok = 0; p->v0 = p->v1 = 0; s_pp_rejected++; }
+                if (f_ok && (p->f0 < w0 || p->f1 > w1)) { f_ok = 0; p->f0 = p->f1 = 0; s_pp_rejected++; }
+                p->vert_ms = v_ok ? (p->v1 - p->v0) / 1e6 : 0;
+                p->frag_ms = f_ok ? (p->f1 - p->f0) / 1e6 : 0;
+                double lo = 1e300, hi = 0;
+                if (v_ok) { lo = p->v0; hi = p->v1; }
+                if (f_ok) { if (p->f0 < lo) lo = p->f0; if (p->f1 > hi) hi = p->f1; }
+                p->span_ms = hi > lo ? (hi - lo) / 1e6 : 0;
+                if (s_pp_all_n < sizeof s_pp_all / sizeof s_pp_all[0]) s_pp_all[s_pp_all_n++] = *p;
+                else s_pp_overflow++;
+            }
+            s_pp_overflow += c->overflow;
+            s_pp_cbs++;
+            s_pp_cb_ms += ([done GPUEndTime] - [done GPUStartTime]) * 1000.0;
+            if (present) {
+                const double busy = pp_busy_ms(s_pp_all, s_pp_all_n);
+                double frag_sum = 0, first = 1e300, last = 0;
+                for (u32 k = 0; k < s_pp_all_n; k++) {
+                    const PPass* p = &s_pp_all[k];
+                    frag_sum += p->frag_ms;
+                    if (p->v1 > p->v0) { if (p->v0 < first) first = p->v0; if (p->v1 > last) last = p->v1; }
+                    if (p->f1 > p->f0) { if (p->f0 < first) first = p->f0; if (p->f1 > last) last = p->f1; }
+                }
+                u32 loads = 0, stores = 0, nclear = 0, draws = 0, blended = 0;
+                double mb = 0;
+                for (u32 k = 0; k < s_pp_all_n; k++) {
+                    const PPass* p = &s_pp_all[k];
+                    for (int a = 0; a < 2; a++) { loads += p->load[a] == 'l'; stores += p->store[a] == 's' || p->store[a] == 'R'; }
+                    nclear += p->load[0] == 'c' || p->load[1] == 'c';
+                    draws += p->draws; blended += p->blended;
+                    mb += pp_traffic_mb(p);
+                }
+                fprintf(stderr, "[pass-prof] frame %u: GPU busy %.2f ms%s (first to last %.2f ms, fragment stages summed %.2f ms, "
+                                "command buffers start to end %.2f ms)%s\n",
+                        frame, busy, c->flat ? " [FLAT blended programs]" : c->snap_off ? " [SNAP REUSE OFF]" : "", last > first ? (last - first) / 1e6 : 0.0, frag_sum, s_pp_cb_ms,
+                        s_pp_rejected ? " -- some stage samples dropped (outside their command buffer)" : "");
+                fprintf(stderr, "[pass-prof] frame %u: %u passes in %u command buffers; "
+                                "%u draws (%u blended); attachment loads %u, stores %u, clears %u, ~%.0f MB moved; "
+                                "%u depth snapshots (%u new textures, %u from the pool), %u copies, %u textures made; "
+                                "stores skipped %u, fallback depths not kept %u%s\n",
+                        frame, s_pp_all_n, s_pp_cbs, draws, blended, loads, stores, nclear, mb,
+                        s_pp_snapshots, zs_new, zs_pooled, s_pp_copies, made, st_saved, zfb_saved,
+                        s_pp_overflow ? " (some passes not timed: too many)" : "");
+                qsort(s_pp_all, s_pp_all_n, sizeof s_pp_all[0], pp_cmp);
+                for (u32 k = 0; k < s_pp_all_n && k < 10; k++) {
+                    const PPass* p = &s_pp_all[k];
+                    char bl[64] = "";
+                    if (p->blended)
+                        snprintf(bl, sizeof bl, " (%u blended, hw: %04X/%04X eq %04X)", p->blended, p->sf, p->df, p->eq);
+                    fprintf(stderr, "[pass-prof]  #%u %-7s %4ux%-4u fmt %3u rt%u msaa%u: span %.2f ms (frag %.2f, vert %.2f), "
+                                    "%u draws%s, load C/Z/S %.3s store C/Z/S %.3s, ~%.1f MB\n",
+                            k + 1, p->kind, p->w, p->h, p->fmt, p->nrt, p->msn ? p->msn : 1, p->span_ms, p->frag_ms,
+                            p->vert_ms, p->draws, bl, p->load, p->store, pp_traffic_mb(p));
+                    /* A heavy pass: its draws by pipeline. fp_/vp_<key> name
+                     * the MSL in the cache folder (cache/msl/fp_<key>.msl). */
+                    static double detail_ms = -1;
+                    if (detail_ms < 0) { const char* e = getenv("RSX_PASS_PROF_DETAIL_MS"); detail_ms = e ? atof(e) : 1.5; }
+                    if (p->frag_ms >= detail_ms)
+                        for (u32 b = 0; b < p->nby; b++) {
+                            const u32 pi = p->by[b].pipe;
+                            const EngPipeline* e = pi && pi <= ENG_MAX_PIPES ? &s_eng_pipe[pi - 1] : NULL;
+                            fprintf(stderr, "[pass-prof]      pipeline %u: fp_%016llx vp_%016llx, %u draws, %u verts, %u textures%s%s%s\n",
+                                    pi, e ? (unsigned long long)pp_msl_key(e->ps_h, 1) : 0ull,
+                                    e ? (unsigned long long)pp_msl_key(e->vs_h, 0) : 0ull,
+                                    p->by[b].n, p->by[b].verts, p->by[b].ntex,
+                                    p->by[b].zsnap ? ", samples a depth snapshot" : "",
+                                    p->by[b].csnap ? ", samples a copy of a target" : "",
+                                    e && e->blend ? "" : ", no blending");
+                        }
+                }
+                s_pp_all_n = s_pp_cbs = s_pp_overflow = 0;
+                s_pp_cb_ms = 0;
+                s_pp_snapshots = s_pp_copies = 0;
+                s_pp_rejected = 0;
+            }
+            os_unfair_lock_unlock(&s_pp_lk);
+        }
+        c->buf = nil;   /* the pool's; the struct is calloc'd, so ARC needs the nil to let go */
+        free(c);
+    }];
+}
+
+/* ---- attachments nobody reads again ---------------------------------------
+ *
+ * Every pass stores every attachment (and loads whatever it does not clear),
+ * which on a tile-based GPU is a write of the whole attachment to memory at
+ * the end of each pass. Two cases need no store:
+ *
+ * RSX_ZFALLBACK_DONTCARE (default 1; 0 off): a pass whose draws named no depth
+ * buffer gets the fallback one (a pipeline always declares depth). When none
+ * of its draws tests depth or stencil, what it holds is never looked at: it
+ * is neither loaded nor stored, and on an Apple GPU it is a memoryless
+ * texture -- tile memory only.
+ *
+ * RSX_STORE_DONTCARE (default 1; 0 off): an attachment whose next use in the
+ * commands recorded so far is a full clear of it is not stored. Every kind of
+ * use counts as one -- a draw that writes it or samples it (directly or
+ * through a view), a copy, a depth snapshot, a rectangle clear -- and none in
+ * what is recorded means it is stored as before: what comes after this
+ * command buffer is unknown. */
+static int eng_flag(const char* name, int dflt)
+{
+    const char* e = getenv(name);
+    return e && *e ? atoi(e) != 0 : dflt;
+}
+static int eng_zfb_dontcare_on(void) { static int on = -1; if (on < 0) on = eng_flag("RSX_ZFALLBACK_DONTCARE", 1); return on; }
+static int eng_store_dontcare_on(void) { static int on = -1; if (on < 0) on = eng_flag("RSX_STORE_DONTCARE", 1); return on; }
+
+/* The fallback depth for a pass that needs none of it: memoryless where the
+ * GPU has tile memory (nil elsewhere: the ordinary fallback serves). */
+static id<MTLTexture> s_eng_zmemless;
+static id<MTLTexture> eng_memoryless_depth(NSUInteger w, NSUInteger h)
+{
+    static int ok = -1;
+    if (ok < 0) {
+        ok = 0;
+        if (@available(macOS 11.0, iOS 13.0, *)) ok = [s_dev supportsFamily:MTLGPUFamilyApple2] ? 1 : 0;
+    }
+    if (!ok) return nil;
+    if (s_eng_zmemless && [s_eng_zmemless width] >= w && [s_eng_zmemless height] >= h) return s_eng_zmemless;
+    const NSUInteger nw = s_eng_zmemless && [s_eng_zmemless width]  > w ? [s_eng_zmemless width]  : w;
+    const NSUInteger nh = s_eng_zmemless && [s_eng_zmemless height] > h ? [s_eng_zmemless height] : h;
+    MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTL_DEPTH_FORMAT
+                                                                                  width:nw height:nh mipmapped:NO];
+    td.usage = MTLTextureUsageRenderTarget;
+    td.storageMode = MTLStorageModeMemoryless;
+    id<MTLTexture> t = [s_dev newTextureWithDescriptor:td];
+    if (!t) { ok = 0; return nil; }
+    s_eng_zmemless = t;
+    return t;
+}
+
+/* Views resolve to the object they were cut from (eng_surface_view), so a
+ * draw sampling a view of a target counts as a use of the target. Filled
+ * per encode, when RSX_STORE_DONTCARE is on. */
+static u32 s_eng_root[ENG_MAX_OBJECTS];
+static void eng_roots_build(void)
+{
+    for (u32 i = 0; i < s_eng_obj_count && i < ENG_MAX_OBJECTS; i++) s_eng_root[i] = i + 1;
+    for (u32 v = 0; v < s_eng_view_count; v++) {
+        const u32 h = s_eng_view[v].view;
+        if (h && h <= ENG_MAX_OBJECTS) s_eng_root[h - 1] = s_eng_view[v].surface;
+    }
+}
+static u32 eng_root(u32 h) { return (h && h <= ENG_MAX_OBJECTS) ? s_eng_root[h - 1] : 0; }
+
+/* Is the next use of object h, from record `from` on, a full clear of it?
+ * want_depth: h is a depth target (cleared by a CLEAR_DS of both depth and
+ * stencil); else a colour target (a CLEAR_COLOR). */
+static int eng_next_use_is_clear(u32 from, u32 h, int want_depth)
+{
+    for (u32 j = from; j < s_eng_rec_count; j++) {
+        const EngRecord* r = &s_eng_rec[j];
+        switch (r->kind) {
+        case ENG_REC_CLEAR_COLOR:
+            if (!want_depth && r->rt[0] == h) return 1;
+            break;
+        case ENG_REC_CLEAR_DS:
+            if (want_depth && r->depth == h)
+                return (r->clear_flags & (RSX_BE_CLEAR_DEPTH | RSX_BE_CLEAR_STENCIL)) ==
+                       (RSX_BE_CLEAR_DEPTH | RSX_BE_CLEAR_STENCIL);
+            break;
+        case ENG_REC_CLEAR_DS_RECT:
+            if (r->depth == h) return 0;
+            break;
+        case ENG_REC_CLEAR_COLOR_RECT:
+            if (r->rt[0] == h) return 0;
+            break;
+        case ENG_REC_DEPTH_RESOLVE: case ENG_REC_DEPTH_COLOR: case ENG_REC_COLOR_COPY:
+            if (r->depth == h || r->resolve_dst == h) return 0;
+            break;
+        case ENG_REC_DRAW:
+            if (r->depth == h) return 0;
+            for (u32 k = 0; k < r->nrt; k++) if (r->rt[k] == h) return 0;
+            for (u32 u = 0; u < RSX_BE_MAX_TEXTURES; u++) if (r->tex[u] && eng_root(r->tex[u]) == h) return 0;
+            for (u32 u = 0; u < RSX_BE_MAX_VERTEX_TEXTURES; u++) if (r->vtex[u] && eng_root(r->vtex[u]) == h) return 0;
+            break;
+        default:
+            return 0;
+        }
+    }
+    return 0;
+}
+
 static u32 s_ft_passes, s_ft_resolves, s_ft_copies;   /* PS3_FTRACE: per command buffer */
 static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
 {
     u32 i = 0;
     s_ft_passes = s_ft_resolves = s_ft_copies = 0;
+    pp_cb_begin();
+    if (eng_store_dontcare_on()) eng_roots_build();
     while (i < s_eng_rec_count) {
         if (s_eng_rec[i].kind == ENG_REC_CLEAR_DS_RECT) {
             eng_encode_clear_rect(cb, &s_eng_rec[i++]);
@@ -5691,7 +6326,7 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
                 [src height] != [dst height] || [src pixelFormat] != [dst pixelFormat]) {
                 s_eng_dropped++; continue;
             }
-            id<MTLBlitCommandEncoder> copy = [cb blitCommandEncoder];
+            id<MTLBlitCommandEncoder> copy = pp_blit(cb, dst);
             if (!copy) { s_eng_dropped++; continue; }
             s_ft_copies++;
             [copy copyFromTexture:src sourceSlice:0 sourceLevel:0
@@ -5714,6 +6349,7 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
             rp.colorAttachments[0].texture     = dst;
             rp.colorAttachments[0].loadAction  = MTLLoadActionDontCare;
             rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+            pp_pass(rp, "zcolor");
             id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp];
             if (!e) continue;
             s_ft_resolves++;
@@ -5733,6 +6369,7 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
             rp.colorAttachments[0].texture     = dst;
             rp.colorAttachments[0].loadAction  = MTLLoadActionDontCare;
             rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+            pp_pass(rp, "zsnap");
             id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp];
             if (!e) continue;
             s_ft_resolves++;
@@ -5884,6 +6521,41 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
             rp.renderTargetWidth  = [zbuf width];
             rp.renderTargetHeight = [zbuf height];
         }
+        /* Attachments nobody reads again (eng_store_dontcare_on above): the
+         * draws this pass will take, then what comes after them. */
+        if (msn == 1 && attach == nrt && (eng_zfb_dontcare_on() || eng_store_dontcare_on())) {
+            u32 j = i, zuse = 0;
+            const int want_plane_ = j < s_eng_rec_count && eng_rec_plane(&s_eng_rec[j]);
+            while (j < s_eng_rec_count && s_eng_rec[j].kind == ENG_REC_DRAW &&
+                   eng_record_targets_are(&s_eng_rec[j], rt, nrt) &&
+                   (s_eng_rec[j].depth == depth || (!s_eng_rec[j].depth && zbuf == zfallback)) &&
+                   eng_rec_plane(&s_eng_rec[j]) == want_plane_) {
+                const u32 pi = s_eng_rec[j].pipeline;
+                if (!pi || pi > s_eng_pipe_count || s_eng_pipe[pi - 1].zuse) zuse = 1;
+                j++;
+            }
+            if (eng_zfb_dontcare_on() && attach && zbuf == zfallback && !depth && !have_clear_ds && !zuse && j > i) {
+                id<MTLTexture> ml = eng_memoryless_depth([tex[0] width], [tex[0] height]);
+                if (ml) { rp.depthAttachment.texture = ml; rp.stencilAttachment.texture = ml; }
+                rp.depthAttachment.loadAction    = MTLLoadActionDontCare;
+                rp.depthAttachment.storeAction   = MTLStoreActionDontCare;
+                rp.stencilAttachment.loadAction  = MTLLoadActionDontCare;
+                rp.stencilAttachment.storeAction = MTLStoreActionDontCare;
+                s_ds_zfb_saved++;
+            }
+            if (eng_store_dontcare_on()) {
+                for (u32 k = 0; k < attach; k++)
+                    if (eng_next_use_is_clear(j, rt[k], 0)) {
+                        rp.colorAttachments[k].storeAction = MTLStoreActionDontCare;
+                        s_ds_stores_saved++;
+                    }
+                if (depth && zbuf != zfallback && eng_next_use_is_clear(j, depth, 1)) {
+                    rp.depthAttachment.storeAction   = MTLStoreActionDontCare;
+                    rp.stencilAttachment.storeAction = MTLStoreActionDontCare;
+                    s_ds_stores_saved++;
+                }
+            }
+        }
         u32 ms_cmask = 0;
         int ms_zw = 0, ms_sw = 0;
         if (msn > 1) {
@@ -5936,6 +6608,7 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
                 plane_pass = 1;
             }
         }
+        pp_pass(rp, "draw");
         id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
         u32 cur_vis = 0;
         if (enc && msn > 1) eng_ms_reload(enc, tex, attach, depth, msn, ms_cmask, ms_zw, ms_sw);
@@ -5973,6 +6646,7 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
             s_eng_pass_samples = msn;
             s_eng_pass_plane = plane_pass;
             eng_encode_draw(enc, &s_eng_rec[i], stage, pf);
+            pp_draw(&s_eng_rec[i]);
             s_eng_pass_samples = 1;
             s_eng_pass_plane = 0;
             i++;
@@ -6026,6 +6700,7 @@ static id<MTLTexture> eng_fxaa(id<MTLCommandBuffer> cb, id<MTLTexture> src)
     rp.colorAttachments[0].texture     = s_eng_fxaa_tex;
     rp.colorAttachments[0].loadAction  = MTLLoadActionDontCare;
     rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    pp_pass(rp, "fxaa");
     id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp];
     if (!e) return src;
     [e setRenderPipelineState:pso];
@@ -6102,6 +6777,7 @@ static void eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
     rp.colorAttachments[0].loadAction  = clear ? MTLLoadActionClear : MTLLoadActionDontCare;
     rp.colorAttachments[0].clearColor  = MTLClearColorMake(0, 0, 0, 1);
     rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    pp_pass(rp, "present");
     id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp];
     if (!e) return;
     if (!draw) { [e endEncoding]; return; }
@@ -6315,6 +6991,7 @@ static void eng_commit_async(void)
                 (void)_unused;
                 eng_stage_release(stage);
             }];
+        pp_cb_end(cb, 0);
         [cb commit];
         s_eng_last_async_cb = cb;
         if (s_eng_dropped) {
@@ -6365,7 +7042,13 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
                 }
 #endif
                 hdr_layer_apply();
+#if TARGET_OS_IPHONE
+                /* the app off the screen: no drawable to be had there, and a
+                 * present from the background is work iOS does not allow */
+                drawable = s_ios_active ? [s_layer nextDrawable] : nil;
+#else
                 drawable = [s_layer nextDrawable];
+#endif
                 if (!drawable) {           /* compositor is busy; skip */
                     dispatch_semaphore_signal(s_inflight);
                     return;
@@ -6441,6 +7124,7 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
             }
             s_eng_plane_drawn = 0;
         }
+        pp_cb_end(cb, present_dst != nil);
         if (drawable) [cb presentDrawable:drawable];
         if (ft_e0) ps3_ft_span(PS3_FT_GPU_ENCODE, 0, present_dst ? 1u : 0u, ft_nrec, ft_e0, ps3_ft_now());
         if (windowed_present) {

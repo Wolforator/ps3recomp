@@ -173,6 +173,15 @@ static unsigned long long g_audio_gaps, g_audio_gap_blocks;   /* AUDIO_GAPS tota
  * soundtrack) waits where it is; the device is fed silence. */
 volatile int g_audio_hold = 0;
 
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
+#if AUDIO_BACKEND_SDL2 && defined(__APPLE__) && TARGET_OS_IPHONE
+#define PS3_AUDIO_STOP_ON_PAUSE 1
+#else
+#define PS3_AUDIO_STOP_ON_PAUSE 0
+#endif
+
 /* ---------------------------------------------------------------------------
  * Host audio output backend
  * -----------------------------------------------------------------------*/
@@ -813,6 +822,21 @@ static void* audio_mix_thread_func(void* arg)
     struct timespec r0 = t0; unsigned rn = 0, dry = 0;
 
     while (s_mix_thread_running) {
+#if PS3_AUDIO_STOP_ON_PAUSE
+        /* iOS: paused (the app in the background) the device itself stops,
+         * rather than playing silence, and nothing is mixed until it is back:
+         * a playing device keeps a backgrounded app running. */
+        if (s_sdl_audio_dev) {
+            static int dev_stopped;
+            const int stop = g_audio_hold == 2;
+            if (stop != dev_stopped) {
+                SDL_PauseAudioDevice(s_sdl_audio_dev, stop);
+                dev_stopped = stop;
+                printf("[cellAudio] device %s\n", stop ? "stopped (paused)" : "playing again");
+            }
+            if (stop) { usleep(20000); continue; }
+        }
+#endif
         if (s_sdl_audio_dev) {
             const u32 queued = audio_backend_queued_samples();
             if (queued >= (u32)target * CELL_AUDIO_BLOCK_SAMPLES) { usleep(1000); continue; }
