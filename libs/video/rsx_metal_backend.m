@@ -63,7 +63,9 @@
 #include <signal.h>
 #include <mach/mach.h>
 #include <mach/mach_time.h>
-#include <servers/bootstrap.h>
+#if !TARGET_OS_IPHONE
+#  include <servers/bootstrap.h>   /* the launcher's surface service (macOS only) */
+#endif
 #include <IOSurface/IOSurfaceRef.h>
 #include "rsx_host_surface.h"
 #include "rsx_commands.h"
@@ -89,7 +91,9 @@ static id<MTLCommandQueue> s_queue;
 static CAMetalLayer*       s_layer;      /* windowed only   */
 static id<MTLTexture>      s_offscreen;  /* headless only   */
 static id<MTLTexture>      s_depth;      /* depth + stencil, both surfaces  */
+#if !TARGET_OS_IPHONE
 static NSWindow*           s_window;
+#endif
 static volatile uint8_t    s_keys[256];    /* host keys down, by macOS virtual keycode */
 static volatile int        s_key_focus;    /* game window is key and the app is active */
 static id                  s_key_monitor;
@@ -1136,6 +1140,11 @@ static int create_window(const char* title)
     });
     return result;
 }
+#endif
+#if TARGET_OS_IPHONE
+/* rsx_draw_engine.c: the Graphics Settings page changed something (declared
+ * with the window code above on macOS). */
+extern volatile int g_rsx_display_reload;
 #endif
 
 static int create_placeholders(void)
@@ -6663,7 +6672,9 @@ static void eng_present(void* user, u32 surface)
       } }
     if (g_rsx_display_reload) {
         g_rsx_display_reload = 0;
-        s_disp_window_pending = 1;
+#if !TARGET_OS_IPHONE
+        s_disp_window_pending = 1;   /* the window follows on the main thread */
+#endif
         const float os = s_eng_scale;
         eng_read_scale();
         if (s_eng_scale != os) eng_rescale();
@@ -6993,6 +7004,7 @@ int rsx_host_mouse_message(void* hwnd, unsigned msg, uintptr_t wp, intptr_t lp, 
     return 0;
 }
 
+#if !TARGET_OS_IPHONE   /* the window and its screen: AppKit; called from the macOS pump only */
 /* Main thread: whether the layer should be in EDR (RSX_HDR, read_hdr_options),
  * and the screen's headroom now, which follows the brightness and is above
  * 1.0 only while something on the screen asks for EDR. Looked at after a
@@ -7077,6 +7089,7 @@ static int display_apply(void)
     fprintf(stderr, "[RSX metal] display: %s, window %ux%u, vsync %d\n", name, ww, wh, s_vsync);
     return 1;
 }
+#endif
 
 #if !TARGET_OS_IPHONE
 /* PS3RECOMP_METAL_EVENT_FILE=<path>: input from a file, for a run with no one

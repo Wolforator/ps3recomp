@@ -215,11 +215,18 @@ if(PS3RECOMP_DEBUG_INFO)
 endif()
 
 if(APPLE)
+    # iOS has no AppKit; the Metal backend's window code is behind
+    # !TARGET_OS_IPHONE and presents into a UIKit view's CAMetalLayer there.
+    if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+        set(_ps3recomp_ui_framework "-framework UIKit" "-framework IOSurface")
+    else()
+        set(_ps3recomp_ui_framework "-framework AppKit")
+    endif()
     target_link_libraries(ps3recomp_runtime PUBLIC
         "-framework Metal"
         "-framework QuartzCore"
         "-framework Foundation"
-        "-framework AppKit"
+        ${_ps3recomp_ui_framework}
     )
     set_source_files_properties(
         "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_metal_backend.m"
