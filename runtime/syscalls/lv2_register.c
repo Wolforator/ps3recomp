@@ -37,6 +37,7 @@ extern void spu_raw_note_image(uint32_t src_ea, uint32_t entry);
 #define SPU_IMAGE_STAGE_END  0x0E000000u
 #define SPU_IMAGE_STAGE_MAX  0x00100000u   /* 1 MB: an SPU image is <=256 KB + headers */
 #include "ps3emu/spu_fallback.h"
+#include "ps3emu/host_stack.h"   /* PS3_HOST_STACK: smaller on iOS */
 #include "../spu/spu_lifted_job.h"   /* spu_run_interp_job — run un-lifted SPU images */
 #include "../spu/spu_lifted_thread.h" /* run a thread's own image, lifted */
 #include "../spu/spu_context.h"       /* the architectural context that runs it */
@@ -685,8 +686,8 @@ static int64_t sys_spu_thread_initialize_handler(ppu_context* ctx)
  * wrong. SPU_HOST_STACK_BIG raises it further for chasing a runaway chain. */
 static size_t spu_host_stack_bytes(void)
 {
-    return getenv("SPU_HOST_STACK_BIG") ? (size_t)512 * 1024 * 1024
-                                   : (size_t)16 * 1024 * 1024;
+    return PS3_HOST_STACK(getenv("SPU_HOST_STACK_BIG") ? (size_t)512 * 1024 * 1024
+                                   : (size_t)16 * 1024 * 1024);
 }
 
 #ifndef _WIN32

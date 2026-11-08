@@ -26,6 +26,7 @@
 /* Environment switches are read where they are used, some of them per call:
  * answer from the pointer-keyed cache (ps3emu/env_cache.h). */
 #include "ps3emu/env_cache.h"
+#include "ps3emu/host_stack.h"   /* PS3_HOST_STACK: smaller on iOS */
 #define getenv(name) ps3_env(name)
 #ifdef _WIN32
 #include <windows.h>
@@ -1632,7 +1633,7 @@ static int spu_task_pool_submit(spu_async_job* j)
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     int prc = EINVAL;
-    if (pthread_attr_setstacksize(&attr, 256u << 20) == 0)
+    if (pthread_attr_setstacksize(&attr, PS3_HOST_STACK(256u << 20)) == 0)
         prc = pthread_create(&th, &attr, spu_pool_thread, w);
     pthread_attr_destroy(&attr);
     if (prc != 0) prc = pthread_create(&th, NULL, spu_pool_thread, w);
@@ -2264,7 +2265,7 @@ int spu_workload_dispatch_task(const uint8_t* image, uint32_t image_size,
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     int prc = EINVAL;
-    if (pthread_attr_setstacksize(&attr, 256u << 20) == 0)
+    if (pthread_attr_setstacksize(&attr, PS3_HOST_STACK(256u << 20)) == 0)
         prc = pthread_create(&th, &attr, spu_async_thread, j);
     pthread_attr_destroy(&attr);
     /* A host that will not reserve that much still gets the thread, on the

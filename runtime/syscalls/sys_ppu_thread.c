@@ -32,6 +32,7 @@ static PPU_TLS int     s_exit_armed = 0;
 #include <stdlib.h>   /* getenv (else return value truncated to int on x64) */
 #include "ps3emu/log_first.h"
 #include "ps3emu/thread_name.h"
+#include "ps3emu/host_stack.h"   /* PS3_HOST_STACK: smaller on iOS */
 #ifndef _WIN32
 #include <errno.h>
 #endif
@@ -733,7 +734,7 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
     {
         pthread_attr_t attr;
         pthread_attr_init(&attr);
-        if (pthread_attr_setstacksize(&attr, PPU_HOST_STACK_BYTES) == 0) {
+        if (pthread_attr_setstacksize(&attr, PS3_HOST_STACK(PPU_HOST_STACK_BYTES)) == 0) {
             rc = pthread_create(&t->host_thread, &attr, ppu_host_thread_proc, t);
         } else {
             rc = EINVAL;
@@ -747,7 +748,7 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
             fprintf(stderr, "[SYS] tid=%llu: no %zu MB host stack (%d), "
                             "falling back to the default\n",
                     (unsigned long long)thread_id,
-                    (size_t)(PPU_HOST_STACK_BYTES / (1024 * 1024)), rc);
+                    PS3_HOST_STACK(PPU_HOST_STACK_BYTES) / (1024 * 1024), rc);
             rc = pthread_create(&t->host_thread, NULL, ppu_host_thread_proc, t);
         }
     }

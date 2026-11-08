@@ -53,6 +53,10 @@ int  rsx_metal_backend_pump_messages(void);
  * key reads released once it is not). Both read 0 in headless mode. */
 int  rsx_metal_backend_key_down(unsigned keycode);
 int  rsx_metal_backend_window_focused(void);
+/* iOS only: the CAMetalLayer of the app's view, before rsx_metal_backend_init
+ * (none: headless), and whether the app is in front (the window's focus). */
+void rsx_metal_backend_ios_attach(void* layer);
+void rsx_metal_backend_ios_set_active(int active);
 /* The mouse's buttons while the cursor is held for a port (rsx_host_mouse.h,
  * which this backend implements for its window): 0 left, 1 right, 2 middle,
  * then the others in the device's order. */

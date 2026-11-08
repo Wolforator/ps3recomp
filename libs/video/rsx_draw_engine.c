@@ -32,6 +32,7 @@
  * answer from the pointer-keyed cache (ps3emu/env_cache.h). */
 #include "ps3emu/vm_watch.h"
 #include "ps3emu/env_cache.h"
+#include "ps3emu/host_stack.h"   /* PS3_HOST_STACK: smaller on iOS */
 #define getenv(name) ps3_env(name)
 #include "ps3emu/log_first.h"
 
@@ -2208,7 +2209,7 @@ static eng_pipe_job* eng_pipe_submit(const char* vs, const char* ps, const rsx_b
             if (!s_pj_threads[t]) break;
 #else
             pthread_attr_t at; pthread_attr_init(&at);
-            pthread_attr_setstacksize(&at, 64u << 20);   /* glslang and spirv-opt recurse deeply */
+            pthread_attr_setstacksize(&at, PS3_HOST_STACK(64u << 20));   /* glslang and spirv-opt recurse deeply */
             const int rc = pthread_create(&s_pj_threads[t], &at, eng_pipe_worker, NULL);
             pthread_attr_destroy(&at);
             if (rc != 0) break;

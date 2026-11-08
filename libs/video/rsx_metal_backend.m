@@ -1145,6 +1145,31 @@ static int create_window(const char* title)
 /* rsx_draw_engine.c: the Graphics Settings page changed something (declared
  * with the window code above on macOS). */
 extern volatile int g_rsx_display_reload;
+
+/* iOS: no window of this backend's. The app's view (src/os/ios in the port)
+ * is backed by a CAMetalLayer and hands it over before the renderer starts;
+ * frames go to its drawables, sized by the view (its bounds in pixels).
+ * Without one the backend runs headless. Whether the app is in front stands
+ * in for the window's focus. */
+static CAMetalLayer* s_ios_layer;
+static volatile int  s_ios_active = 1;
+
+void rsx_metal_backend_ios_attach(void* layer) { s_ios_layer = (__bridge CAMetalLayer*)layer; }
+void rsx_metal_backend_ios_set_active(int active) { s_ios_active = active; }
+
+static int attach_ios_layer(void)
+{
+    if (!s_ios_layer) return -1;
+    void (^setup)(void) = ^{
+        s_ios_layer.device          = s_dev;
+        s_ios_layer.pixelFormat     = MTLPixelFormatBGRA8Unorm;
+        s_ios_layer.framebufferOnly = YES;
+    };
+    if ([NSThread isMainThread]) setup();
+    else dispatch_sync(dispatch_get_main_queue(), setup);
+    s_layer = s_ios_layer;
+    return 0;
+}
 #endif
 
 static int create_placeholders(void)
@@ -6811,8 +6836,12 @@ int rsx_metal_backend_init(u32 width, u32 height, const char* title)
 
         int rc;
 #if TARGET_OS_IPHONE
-        s_headless = 1;
-        rc = create_offscreen();
+        if (s_headless || attach_ios_layer() != 0) {
+            s_headless = 1;
+            rc = create_offscreen();
+        } else {
+            rc = 0;
+        }
 #else
         /* Under a launcher (tools/host_window) the window is the launcher's.
          * Without an answer from it the run is not lost: it opens a window of
@@ -6902,6 +6931,12 @@ int rsx_metal_backend_init(u32 width, u32 height, const char* title)
                     s_view_px_w, s_view_px_h, s_vsync, (double)s_eng_scale,
                     sc_dim(s_width), sc_dim(s_height),
                     s_eng_active || s_eng_scale == 1.0f ? "" : " -- scale needs the draw engine, ignored");
+#else
+        if (!s_headless) {
+            const CGSize ds = s_layer.drawableSize;
+            fprintf(stderr, "[RSX metal] the app's view, drawable %.0fx%.0f px, internal scale %g (%ux%u)\n",
+                    ds.width, ds.height, (double)s_eng_scale, sc_dim(s_width), sc_dim(s_height));
+        }
 #endif
         return 0;
     }
@@ -6964,7 +6999,7 @@ int rsx_metal_backend_window_focused(void)
 #if !TARGET_OS_IPHONE
     return s_window != nil && s_key_focus;
 #else
-    return 0;
+    return s_layer != nil && s_ios_active;
 #endif
 }
 
