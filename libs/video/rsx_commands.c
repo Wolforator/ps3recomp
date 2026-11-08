@@ -22,6 +22,84 @@
 #include "../../runtime/memory/vm.h"    /* VM_HLE_INJECT_BASE */
 #include "ps3emu/log_first.h"
 
+/* ---- back-end releases held behind a query fence ---------------------------
+ * (rsx_draw_engine.h: rsx_release_fence_issue / _done.) A release is a
+ * guest-memory write the title polls; one that comes after occlusion queries
+ * tells it the counts are in. The draw engine's query fence used to make the
+ * walker wait for the GPU before going on, so the walker could write the
+ * release as it reached it -- and stood idle while the GPU drew, every frame
+ * (Drakengard 3: one such fence a frame, 8-9 ms on an M2). With the fence
+ * asynchronous, the walker goes on and the releases wait here instead, each
+ * for the fences issued before it, landing in FIFO order. Called from the
+ * walker (issue, queueing) and a Metal completion thread (done). */
+static volatile char s_rel_lk;
+static u32 s_rel_issued, s_rel_done;
+/* A queued item is a write (fn NULL) or work that reads what the fence
+ * delivers -- the title's occlusion-report copies (cellGcmSys.c) -- run in
+ * its place in the order: fn(p) once the fences before it are done. */
+typedef struct { u32 ea, val, need; void (*fn)(void*); void* p; } RelWrite;
+#define REL_MAX 1024u
+static RelWrite s_relq[REL_MAX];
+static u32 s_relq_head, s_relq_n;
+static void rel_lock(void) { while (__atomic_test_and_set(&s_rel_lk, __ATOMIC_ACQUIRE)) { } }
+static void rel_unlock(void) { __atomic_clear(&s_rel_lk, __ATOMIC_RELEASE); }
+
+void rsx_release_fence_issue(void)
+{
+    rel_lock();
+    s_rel_issued++;
+    rel_unlock();
+}
+
+void rsx_release_fence_done(void)
+{
+    extern void vm_write32(uint32_t a, uint32_t v);
+    extern void (*g_gcm_label_write_hook)(void);
+    int wrote = 0;
+    rel_lock();
+    s_rel_done++;
+    while (s_relq_n && s_relq[s_relq_head].need <= s_rel_done) {
+        const RelWrite* w = &s_relq[s_relq_head];
+        if (w->fn) w->fn(w->p); else vm_write32(w->ea, w->val);
+        s_relq_head = (s_relq_head + 1) % REL_MAX;
+        s_relq_n--;
+        wrote = 1;
+    }
+    rel_unlock();
+    if (wrote && g_gcm_label_write_hook) g_gcm_label_write_hook();   /* wake a poll waiting on it */
+}
+
+/* A back-end release: now, or queued behind the fences before it. */
+static void rel_write(u32 ea, u32 val)
+{
+    extern void vm_write32(uint32_t a, uint32_t v);
+    rel_lock();
+    if (!s_relq_n && s_rel_done == s_rel_issued) {
+        vm_write32(ea, val);
+    } else if (s_relq_n < REL_MAX) {
+        RelWrite* w = &s_relq[(s_relq_head + s_relq_n) % REL_MAX];
+        w->ea = ea; w->val = val; w->need = s_rel_issued; w->fn = NULL; w->p = NULL;
+        s_relq_n++;
+    } else {
+        vm_write32(ea, val);   /* cannot happen with a fence a frame; better late order than a lost write */
+    }
+    rel_unlock();
+}
+
+int rsx_release_defer(void (*fn)(void*), void* p)
+{
+    int queued = 0;
+    rel_lock();
+    if ((s_relq_n || s_rel_done != s_rel_issued) && s_relq_n < REL_MAX) {
+        RelWrite* w = &s_relq[(s_relq_head + s_relq_n) % REL_MAX];
+        w->ea = w->val = 0; w->need = s_rel_issued; w->fn = fn; w->p = p;
+        s_relq_n++;
+        queued = 1;
+    }
+    rel_unlock();
+    return queued;
+}
+
 /* ---------------------------------------------------------------------------
  * Global backend
  * -----------------------------------------------------------------------*/
@@ -529,7 +607,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         u32 ea = gcm_io_offset_to_ea(s_sem_off);
         u32 val = method == 0x1D74 ? data
                 : (data & 0xff00ff00u) | ((data >> 16) & 0xffu) | ((data & 0xffu) << 16);
-        if (ea) vm_write32(ea, val);
+        if (ea) rel_write(ea, val);
         return 0;
       }
       if (method == 0x1D70) {
@@ -542,7 +620,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
          * 0x00010000 != 1 and spun forever (gcm/cube sample hang after init).
          * Apply the same swap the hardware does so the pre-swap cancels out. */
         u32 val = (data & 0xff00ff00u) | ((data >> 16) & 0xffu) | ((data & 0xffu) << 16);
-        vm_write32(VM_HLE_INJECT_BASE + (s_sem_off & 0x00FFFFFFu), val);
+        rel_write(VM_HLE_INJECT_BASE + (s_sem_off & 0x00FFFFFFu), val);
         { static u32 seen[64]; static int ns = 0; int k = 0;   /* TEMP: distinct release offsets */
           for (; k < ns; k++) if (seen[k] == s_sem_off) break;
           if (k == ns && ns < 64) { seen[ns++] = s_sem_off;
@@ -551,8 +629,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         return 0;
       }
       if (method == 0x1D74) {
-        extern void vm_write32(uint32_t a, uint32_t v);
-        vm_write32(VM_HLE_INJECT_BASE + (s_sem_off & 0x00FFFFFFu), data);
+        rel_write(VM_HLE_INJECT_BASE + (s_sem_off & 0x00FFFFFFu), data);
         return 0;
       } }
     if ((method >= 0x200 && method <= 0x23C) ||

@@ -312,7 +312,27 @@ typedef struct rsx_draw_backend {
      * above such a shader's text; zero leaves the RGBA16F plane (rgb what
      * went to the frame, a how many times brighter it was). */
     int hdr_plane_packed;
+    /* The occlusion-query fence without the wait (RSX_QUERY_ASYNC): submit
+     * everything recorded, and when the GPU has run it, deliver the query
+     * counts (rsx_draw_engine_query_result) and then call
+     * rsx_release_fence_done(), which lands the semaphore releases the walker
+     * queued behind the fence. NULL: the engine waits (submit_and_wait). */
+    void (*query_fence_async)(void* user);
 } rsx_draw_backend;
+
+/* Back-end semaphore releases (NV4097 0x1D70/0x1D74) held behind the GPU
+ * (rsx_commands.c): rsx_release_fence_issue() before a query fence is
+ * submitted makes every release the walker reaches after it wait in a queue;
+ * rsx_release_fence_done(), from the fence's completion, lands them in order
+ * once each one's fence has passed. With no fence outstanding a release is
+ * written at once, as it always was. */
+void rsx_release_fence_issue(void);
+void rsx_release_fence_done(void);
+/* Work that must see what the outstanding fences deliver, in its place among
+ * the queued releases: queued, returning 1, while a fence is outstanding --
+ * fn(p) then runs on the completion thread -- else 0, and the caller does it
+ * now. */
+int rsx_release_defer(void (*fn)(void*), void* p);
 
 /* ---- the engine --------------------------------------------------------- */
 

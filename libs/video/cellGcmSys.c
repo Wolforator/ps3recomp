@@ -1457,17 +1457,53 @@ typedef struct { u32 src, dst, len, lines, in_pitch, out_pitch; } gcm_report_cop
 static gcm_report_copy s_rcopy[1024];
 static u32 s_rcopy_n;
 static void nv0039_report_bytes(u32 report_off, u8* out);
-static void gcm_report_copies_flush(void)
+static void gcm_report_copies_run(const gcm_report_copy* list, u32 n)
 {
-    if (!s_rcopy_n) return;
-    rsx_draw_engine_sync_queries();
-    for (u32 k = 0; k < s_rcopy_n; k++) {
-        const gcm_report_copy* c = &s_rcopy[k];
+    for (u32 k = 0; k < n; k++) {
+        const gcm_report_copy* c = &list[k];
         for (u32 l = 0; l < c->lines; l++) {
             const u32 s0 = c->src + l * c->in_pitch, d0 = c->dst + l * c->out_pitch;
             for (u32 i = 0; i < c->len; i++) { u8 b; nv0039_report_bytes(s0 + i, &b); vm_write8(d0 + i, b); }
         }
     }
+}
+typedef struct { u32 n; gcm_report_copy c[]; } gcm_report_copy_batch;
+static void gcm_report_copies_deferred(void* p)
+{
+    gcm_report_copy_batch* b = (gcm_report_copy_batch*)p;
+    gcm_report_copies_run(b->c, b->n);
+    free(b);
+}
+/* With the query fence asynchronous (RSX_QUERY_ASYNC) the draw engine sees
+ * the BACK_END release first and sends the fence off without waiting, so the
+ * counts are not in yet when the walker gets here: copied now, the title's
+ * buffer got each index's previous value -- last frame's, another object's --
+ * and during Drakengard 3's dragon fire (hundreds of queries a frame) the
+ * whole scene flickered as things were culled and shown by turns. The copies
+ * then go into the release queue instead, behind that fence and ahead of the
+ * release the title waits on, and run on the fence's completion once the
+ * counts are written. GCM_REPORT_COPY_UNORDERED=1 copies at once, as before
+ * (to see the flicker). */
+static void gcm_report_copies_flush(void)
+{
+    if (!s_rcopy_n) return;
+    rsx_draw_engine_sync_queries();
+    static int unordered = -1;
+    if (unordered < 0) unordered = getenv("GCM_REPORT_COPY_UNORDERED") ? 1 : 0;
+    if (!unordered) {
+        gcm_report_copy_batch* b = (gcm_report_copy_batch*)malloc(sizeof *b + s_rcopy_n * sizeof b->c[0]);
+        if (b) {
+            b->n = s_rcopy_n;
+            memcpy(b->c, s_rcopy, s_rcopy_n * sizeof b->c[0]);
+            if (rsx_release_defer(gcm_report_copies_deferred, b)) {
+                static int _l = 0; if (PS3_LOG_FIRST(_l, 1))
+                    fprintf(stderr, "[gcm] occlusion-report copies wait behind the query fence (first: %u)\n", s_rcopy_n);
+                s_rcopy_n = 0; return;
+            }
+            free(b);
+        }
+    }
+    gcm_report_copies_run(s_rcopy, s_rcopy_n);
     s_rcopy_n = 0;
 }
 

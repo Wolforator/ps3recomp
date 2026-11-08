@@ -3726,6 +3726,8 @@ static u32 s_snap_last_surface = ~0u; static unsigned long s_inval_at_last_snap 
  * RSX_SNAP_STATS counts the reuses as well. */
 static int s_snap_reuse = -1, s_snap_alt;
 int g_rsx_snap_reuse_off;   /* alternate: off now (RSX_PASS_PROF marks its frames) */
+int g_rsx_query_visible_now;   /* RSX_QUERY_VISIBLE alternate: on now (likewise) */
+int g_rsx_query_async_now = -1; /* RSX_QUERY_ASYNC: the fence's mode at the last one (-1 none yet) */
 static unsigned long s_snap_reused;
 static struct { u32 handle, snap, frame; unsigned long inval; } s_snap_cache[ENG_MAX_SURFACES];
 static int snap_reuse_mode(void)
@@ -5196,6 +5198,7 @@ void rsx_draw_engine_shutdown(void)
     g.be = be;
 }
 
+static void eng_query_result_ordered(u32 report_index, u64 count);
 void rsx_draw_engine_method(u32 method, u32 arg)
 {
     if (!g.ready) return;
@@ -5222,13 +5225,46 @@ void rsx_draw_engine_method(u32 method, u32 arg)
      * an open query counts regardless. A query whose draws never reached the
      * backend -- dropped, not drawn -- reports "visible": a bug of ours must
      * not hide the object. */
-    if (m == 0x17C8u && arg == 1u && g.be->query_begin) {
+    /* RSX_QUERY_VISIBLE=1 (diagnostics): every occlusion query answers
+     * "visible" at once -- nothing counted on the GPU, no fence to wait for.
+     * The title then culls nothing by occlusion (more drawn) and whatever it
+     * shows by a count (a flare) shows regardless. */
+    /* RSX_QUERY_VISIBLE=alternate: on and off by turns, 10 s each, switching
+     * at a frame's start (a before/after in the same scenes; the log says
+     * when, RSX_PASS_PROF marks the frames). */
+    static int q_mode = -1, q_vis = 0;
+    static u32 q_frame = ~0u;
+    if (q_mode < 0) {
+        const char* e = getenv("RSX_QUERY_VISIBLE");
+        q_mode = !e || !*e || *e == '0' ? 0 : !strcmp(e, "alternate") ? 2 : 1;
+        q_vis = q_mode == 1;
+        g_rsx_query_visible_now = q_vis;
+    }
+    if (q_mode == 2 && g.frames != q_frame) {
+        q_frame = g.frames;
+        struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+        const int on = (int)((ts.tv_sec / 10) & 1);
+        if (on != q_vis) {
+            q_vis = on;
+            g_rsx_query_visible_now = on;
+            fprintf(stderr, "[rsx engine] RSX_QUERY_VISIBLE alternate: %s\n", on ? "every query VISIBLE" : "queries counted");
+        }
+    }
+    if (q_vis && (m == 0x17C8u || m == 0x1800u)) {
+        if (m == 0x1800u && (arg >> 24) == 1u) {
+            eng_query_result_ordered((arg & 0xFFFFFFu) / 16u, 0xFFFFu);
+            if (g.q_cur) {   /* one opened before the switch */
+                g.q_cur = 0;
+                if (g.be->query_set) g.be->query_set(g.be->user, 0);
+            }
+        }
+    } else if (m == 0x17C8u && arg == 1u && g.be->query_begin) {
         g.q_cur = g.be->query_begin(g.be->user);
         g.q_attempts = g.q_draws = 0;
     } else if (m == 0x1800u && (arg >> 24) == 1u && g.q_cur) {
         const u32 index = (arg & 0xFFFFFFu) / 16u;
         if (g.q_draws && g.q_draws >= g.q_attempts) { g.be->query_report(g.be->user, g.q_cur, index); g.q_unflushed++; }
-        else rsx_draw_engine_query_result(index, 0xFFFFu);
+        else eng_query_result_ordered(index, 0xFFFFu);
         g.q_cur = 0;
         if (g.be->query_set) g.be->query_set(g.be->user, 0);
     } else if (m == 0x1D70u && g.q_unflushed && g.be->submit_and_wait) {
@@ -5241,7 +5277,43 @@ void rsx_draw_engine_method(u32 method, u32 arg)
          * flickered out for single frames. Finish the GPU work up to here and
          * deliver the counts before the fence lands. RSX_QUERY_NOSYNC=1 off. */
         if (g_rsx_query_nosync < 0) g_rsx_query_nosync = getenv("RSX_QUERY_NOSYNC") ? 1 : 0;
-        if (!g_rsx_query_nosync) g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_QUERY_FENCE);
+        /* RSX_QUERY_ASYNC=1: rather than the walker waiting for the GPU here,
+         * the release that follows waits for it (rsx_release_fence_issue) and
+         * the walker goes on with the frame. On by default (RSX_QUERY_ASYNC=0
+         * waits): on an iPhone the wait leaves the GPU idle mid-frame, iOS
+         * clocks it down, and the fire scene ran 16.0 ms GPU / 55.9 fps
+         * waiting against 14.0 ms / 59 fps async. Its flicker was the
+         * occlusion-report copies running before the counts were in; they
+         * now wait behind the fence too (cellGcmSys.c,
+         * gcm_report_copies_flush). */
+        /* RSX_QUERY_ASYNC=alternate: async and the wait by turns, 10 s
+         * each, switching at a frame's start (a before/after in the same
+         * scenes; the log says when, RSX_PASS_PROF marks the frames). */
+        static int async = -1, alt = 0;
+        static u32 alt_frame = ~0u;
+        if (async < 0) {
+            const char* e = getenv("RSX_QUERY_ASYNC");
+            alt = e && !strcmp(e, "alternate");
+            async = alt ? 0 : e && *e ? atoi(e) != 0 : 1;
+        }
+        if (alt && g.frames != alt_frame) {
+            alt_frame = g.frames;
+            struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+            const int on = (int)((ts.tv_sec / 10) & 1);
+            if (on != async || alt_frame == 0) {
+                async = on;
+                fprintf(stderr, "[rsx engine] RSX_QUERY_ASYNC alternate: %s\n", on ? "ASYNC" : "the wait (sync)");
+            }
+        }
+        g_rsx_query_async_now = async;
+        if (!g_rsx_query_nosync) {
+            if (async && g.be->query_fence_async) {
+                rsx_release_fence_issue();
+                g.be->query_fence_async(g.be->user);
+            } else {
+                g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_QUERY_FENCE);
+            }
+        }
         g.q_unflushed = 0;
     }
     if ((m == 0x17C8u || m == 0x1800u || m == 0x1D84u) && s_dtrace_frame >= 0 &&
@@ -5272,6 +5344,27 @@ void rsx_draw_engine_upload_run(u32 method, u32 count, const u8* be)
 }
 
 void cellGcm_set_report_value(u32 index, u32 value);   /* cellGcmSys.c */
+/* A count the walker answers itself (no draws reached the GPU, or
+ * RSX_QUERY_VISIBLE): behind any query fence still outstanding, so a
+ * fence's later delivery of last frame's count for a reused index cannot
+ * overwrite it (report indices are a per-frame pool). */
+typedef struct { u32 index; u64 count; } eng_query_now;
+static void eng_query_result_deferred(void* p)
+{
+    eng_query_now* q = (eng_query_now*)p;
+    rsx_draw_engine_query_result(q->index, q->count);
+    free(q);
+}
+static void eng_query_result_ordered(u32 report_index, u64 count)
+{
+    eng_query_now* q = (eng_query_now*)malloc(sizeof *q);
+    if (q) {
+        q->index = report_index; q->count = count;
+        if (rsx_release_defer(eng_query_result_deferred, q)) return;
+        free(q);
+    }
+    rsx_draw_engine_query_result(report_index, count);
+}
 void rsx_draw_engine_query_result(u32 report_index, u64 count)
 {
     static int log = -1; if (log < 0) log = getenv("RSX_QUERY_LOG") ? 1 : 0;

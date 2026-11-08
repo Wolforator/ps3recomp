@@ -1156,6 +1156,8 @@ static volatile int  s_ios_active = 1;
 
 void rsx_metal_backend_ios_attach(void* layer) { s_ios_layer = (__bridge CAMetalLayer*)layer; }
 void rsx_metal_backend_ios_set_active(int active) { s_ios_active = active; }
+static volatile double s_ios_min_interval;   /* seconds a frame stays up at least; 0 none */
+void rsx_metal_backend_set_min_frame_interval(double seconds) { s_ios_min_interval = seconds > 0.0 ? seconds : 0.0; }
 
 static int attach_ios_layer(void)
 {
@@ -3001,6 +3003,7 @@ static NSString* const kEngHelperMSL = @
 "using namespace metal;\n"
 "fragment float4 eng_flat_fs() { return float4(0.02, 0.01, 0.0, 0.05); }\n"   /* RSX_PP_FLAT_BLENDED */
 "struct BOut { float4 pos [[position]]; float2 uv; };\n"
+
 "vertex BOut eng_fullscreen_vs(uint vid [[vertex_id]]) {\n"
 "    float2 p = float2((vid << 1) & 2, vid & 2);\n"
 "    BOut o; o.pos = float4(p * 2.0 - 1.0, 0.0, 1.0);\n"
@@ -3700,6 +3703,46 @@ static void eng_shutdown(void* user)
 }
 
 static u32 s_ft_flush_reason;   /* PS3_FTRACE: why the commit in progress was asked for */
+
+/* RSX_WAIT_STATS=1: every 300 presents, where the thread that walks the
+ * command buffer (the frame clock's) waited for the GPU, per present: the
+ * synchronous submits by reason (submit_and_wait: 0 the vertex ring full,
+ * 1 a guest reference, 2 shutdown, 3 the occlusion-query fence) and
+ * readbacks -- each waits for everything submitted, so the CPU and the GPU
+ * take turns -- the wait for a free frame slot (MTL_MAX_INFLIGHT), the wait
+ * for a drawable, and the encoding itself. */
+static int s_ws_on = -1;
+static double s_ws_sync_ms[5], s_ws_slot_ms, s_ws_drawable_ms, s_ws_encode_ms, s_ws_readback_ms;
+static u32 s_ws_sync_n[5], s_ws_readback_n, s_ws_presents, s_ws_async_n;
+static uint64_t s_ws_t0;
+static double ws_ms(uint64_t a, uint64_t b)
+{
+    static mach_timebase_info_data_t tb;
+    if (!tb.denom) mach_timebase_info(&tb);
+    return (double)(b - a) * tb.numer / tb.denom / 1e6;
+}
+static int ws_on(void) { if (s_ws_on < 0) s_ws_on = getenv("RSX_WAIT_STATS") ? 1 : 0; return s_ws_on; }
+static void ws_present_done(void)
+{
+    if (!ws_on()) return;
+    const uint64_t now = mach_absolute_time();
+    if (!s_ws_t0) s_ws_t0 = now;
+    if (++s_ws_presents < 300) return;
+    const double n = s_ws_presents, span = ws_ms(s_ws_t0, now);
+    fprintf(stderr, "[gpu-wait] %u presents in %.0f ms (%.2f ms each); per present: sync submits %.2f (%.2f ms) "
+                    "[ring %.2f/%.2f, guest ref %.2f/%.2f, query fence %.2f/%.2f]; readbacks %.2f (%.2f ms); "
+                    "frame slot %.2f ms; drawable %.2f ms; the whole present call %.2f ms; async query fences %.2f\n",
+            s_ws_presents, span, span / n,
+            (s_ws_sync_n[0] + s_ws_sync_n[1] + s_ws_sync_n[3]) / n,
+            (s_ws_sync_ms[0] + s_ws_sync_ms[1] + s_ws_sync_ms[3]) / n,
+            s_ws_sync_n[0] / n, s_ws_sync_ms[0] / n, s_ws_sync_n[1] / n, s_ws_sync_ms[1] / n,
+            s_ws_sync_n[3] / n, s_ws_sync_ms[3] / n, s_ws_readback_n / n, s_ws_readback_ms / n,
+            s_ws_slot_ms / n, s_ws_drawable_ms / n, s_ws_encode_ms / n, s_ws_async_n / n);
+    memset(s_ws_sync_ms, 0, sizeof s_ws_sync_ms); memset(s_ws_sync_n, 0, sizeof s_ws_sync_n);
+    s_ws_slot_ms = s_ws_drawable_ms = s_ws_encode_ms = s_ws_readback_ms = 0;
+    s_ws_readback_n = s_ws_presents = s_ws_async_n = 0;
+    s_ws_t0 = now;
+}
 static void eng_submit_and_wait(void* user, u32 reason)
 {
     (void)user;
@@ -5846,6 +5889,8 @@ typedef struct {
     uint64_t cpu0, gpu0;   /* a CPU/GPU timestamp pair taken as it was encoded */
     int flat;              /* RSX_PP_FLAT_BLENDED was on for it */
     int snap_off;          /* RSX_SNAP_REUSE=alternate had it off */
+    int qvis;              /* RSX_QUERY_VISIBLE=alternate had it on */
+    int qasync;            /* RSX_QUERY_ASYNC: the fence mode (-1 none yet) */
 } PPCb;
 static int      s_pp_every = -1;
 static id<MTLCounterSet> s_pp_set;
@@ -5946,6 +5991,8 @@ static void pp_cb_begin(void)
         c->buf = b;
         c->flat = s_pp_flat_mode > 0 ? pp_flat_now() : 0;
         { extern int g_rsx_snap_reuse_off; c->snap_off = g_rsx_snap_reuse_off; }
+        { extern int g_rsx_query_visible_now; c->qvis = g_rsx_query_visible_now; }
+        { extern int g_rsx_query_async_now; c->qasync = g_rsx_query_async_now; }
         [s_dev sampleTimestamps:&c->cpu0 gpuTimestamp:&c->gpu0];
         s_pp_cb = c;
     }
@@ -6152,7 +6199,9 @@ static void pp_cb_end(id<MTLCommandBuffer> cb, int present)
                 }
                 fprintf(stderr, "[pass-prof] frame %u: GPU busy %.2f ms%s (first to last %.2f ms, fragment stages summed %.2f ms, "
                                 "command buffers start to end %.2f ms)%s\n",
-                        frame, busy, c->flat ? " [FLAT blended programs]" : c->snap_off ? " [SNAP REUSE OFF]" : "", last > first ? (last - first) / 1e6 : 0.0, frag_sum, s_pp_cb_ms,
+                        frame, busy, c->flat ? " [FLAT blended programs]" : c->snap_off ? " [SNAP REUSE OFF]"
+                                     : c->qvis ? " [QUERIES VISIBLE]" : c->qasync == 1 ? " [QUERY ASYNC]"
+                                     : c->qasync == 0 ? " [QUERY SYNC]" : "", last > first ? (last - first) / 1e6 : 0.0, frag_sum, s_pp_cb_ms,
                         s_pp_rejected ? " -- some stage samples dropped (outside their command buffer)" : "");
                 fprintf(stderr, "[pass-prof] frame %u: %u passes in %u command buffers; "
                                 "%u draws (%u blended); attachment loads %u, stores %u, clears %u, ~%.0f MB moved; "
@@ -7006,6 +7055,82 @@ static void eng_commit_async(void)
     }
 }
 
+/* The occlusion-query fence without the wait (rsx_draw_backend.
+ * query_fence_async, RSX_QUERY_ASYNC): what is recorded goes to the GPU, and
+ * the walker goes on. When the GPU has run it, the completion handler
+ * delivers the counts of the queries in it and then lets the releases the
+ * walker queued behind this fence land (rsx_release_fence_done), so the title
+ * sees its fence only with the counts in place -- the order the wait gave,
+ * without the CPU and the GPU taking turns. Command buffers on the one queue
+ * complete in order, so the fences are done in the order they were issued. */
+static void eng_query_fence_async(void* user)
+{
+    (void)user;
+    @autoreleasepool {
+        id<MTLBuffer> stage = nil;
+        if (s_eng_stage_used) {
+            stage = s_eng_stage_buf;
+            s_eng_stage_buf = nil;
+            s_eng_stage = NULL;
+            s_eng_stage_cap = 0;
+        }
+        /* as eng_commit_async: trailing clears stay for the next pass */
+        u32 keep_from = s_eng_rec_count;
+        while (keep_from > 0 && s_eng_rec[keep_from - 1].kind != ENG_REC_DRAW &&
+               (s_eng_rec[keep_from - 1].kind == ENG_REC_CLEAR_COLOR ||
+                s_eng_rec[keep_from - 1].kind == ENG_REC_CLEAR_DS))
+            keep_from--;
+        const u32 n_keep = s_eng_rec_count - keep_from;
+        s_eng_rec_count = keep_from;
+        s_eng_submit_seq++;
+        id<MTLCommandBuffer> cb = [s_queue commandBuffer];
+        if (!cb) {   /* no command buffer: the wait, as before */
+            s_eng_rec_count += n_keep;
+            if (stage) { s_eng_stage_buf = stage; s_eng_stage_used = 1; }
+            s_ft_flush_reason = RSX_BE_FLUSH_QUERY_FENCE;
+            eng_encode_and_commit(nil);
+            rsx_release_fence_done();
+            return;
+        }
+        eng_gpu_time_hook(cb, 0);
+        eng_encode_records(cb, stage);
+        if (n_keep) memmove(&s_eng_rec[0], &s_eng_rec[keep_from], n_keep * sizeof s_eng_rec[0]);
+        EngVisReport* reps = NULL;
+        const u32 n = s_vis_npending;
+        if (n && s_vis_buf) {
+            reps = (EngVisReport*)malloc(n * sizeof *reps);
+            if (reps) memcpy(reps, s_vis_pending, n * sizeof *reps);
+        }
+        s_vis_npending = 0;
+        id<MTLBuffer> vb = s_vis_buf;
+        id<MTLCommandBuffer> prior = s_eng_last_async_cb;
+        [cb addCompletedHandler:^(id<MTLCommandBuffer> _unused) {
+            (void)_unused;
+            if (stage) eng_stage_release(stage);
+            if (prior) [prior waitUntilCompleted];
+            if (reps) {
+                const u64* c = (const u64*)[vb contents];
+                for (u32 k = 0; k < n; k++)
+                    rsx_draw_engine_query_result(reps[k].index, eng_vis_total(reps[k].slot, c));
+                free(reps);
+            }
+            rsx_release_fence_done();
+        }];
+        pp_cb_end(cb, 0);
+        [cb commit];
+        s_eng_last_async_cb = cb;
+        if (ws_on()) s_ws_async_n++;
+        if (s_eng_dropped) {
+            fprintf(stderr, "[rsx engine/metal] dropped %u record(s) (cap %d)\n", s_eng_dropped, ENG_MAX_RECORDS);
+            s_eng_dropped = 0;
+        }
+        s_eng_rec_count  = n_keep;
+        s_eng_stage_used = 0;
+        eng_collect_retired_objects();
+        eng_collect_retired_buffers();
+    }
+}
+
 static void eng_encode_and_commit(id<MTLTexture> present_dst)
 {
     @autoreleasepool {
@@ -7014,8 +7139,13 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
         int host_slot = -1;
         const u32 host_gen = s_host_gen;
         const int windowed_present = (present_dst && !s_headless);
+        const uint64_t ws_e0 = mach_absolute_time();
         { const uint64_t w0 = PS3_FT_ON() ? ps3_ft_now() : 0;
-          if (windowed_present) dispatch_semaphore_wait(s_inflight, DISPATCH_TIME_FOREVER);
+          if (windowed_present) {
+              const uint64_t s0 = mach_absolute_time();
+              dispatch_semaphore_wait(s_inflight, DISPATCH_TIME_FOREVER);
+              if (ws_on()) s_ws_slot_ms += ws_ms(s0, mach_absolute_time());
+          }
           if (w0 && windowed_present) { const uint64_t w1 = ps3_ft_now();
               if (w1 - w0 >= ps3_ft_min_ns()) ps3_ft_span(PS3_FT_GPU_WAIT, 0, 2, 0, w0, w1); } }
         if (present_dst) {
@@ -7042,6 +7172,7 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
                 }
 #endif
                 hdr_layer_apply();
+                const uint64_t d0 = mach_absolute_time();
 #if TARGET_OS_IPHONE
                 /* the app off the screen: no drawable to be had there, and a
                  * present from the background is work iOS does not allow */
@@ -7049,6 +7180,7 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
 #else
                 drawable = [s_layer nextDrawable];
 #endif
+                if (ws_on()) s_ws_drawable_ms += ws_ms(d0, mach_absolute_time());
                 if (!drawable) {           /* compositor is busy; skip */
                     dispatch_semaphore_signal(s_inflight);
                     return;
@@ -7125,7 +7257,18 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
             s_eng_plane_drawn = 0;
         }
         pp_cb_end(cb, present_dst != nil);
+#if TARGET_OS_IPHONE
+        /* A 120 Hz (ProMotion) screen: each frame up for at least the frame
+         * rate cap's interval (rsx_metal_backend_set_min_frame_interval), so
+         * 60 fps is every second refresh rather than an 8 ms frame now and a
+         * 25 ms one next. Uncapped: shown as soon as possible. */
+        if (drawable) {
+            if (s_ios_min_interval > 0.0) [cb presentDrawable:drawable afterMinimumDuration:s_ios_min_interval];
+            else [cb presentDrawable:drawable];
+        }
+#else
         if (drawable) [cb presentDrawable:drawable];
+#endif
         if (ft_e0) ps3_ft_span(PS3_FT_GPU_ENCODE, 0, present_dst ? 1u : 0u, ft_nrec, ft_e0, ps3_ft_now());
         if (windowed_present) {
             dispatch_semaphore_t sem = s_inflight;
@@ -7137,10 +7280,17 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
                 dispatch_semaphore_signal(sem);
             }];
             [cb commit];
+            if (ws_on()) { s_ws_encode_ms += ws_ms(ws_e0, mach_absolute_time()) ; ws_present_done(); }
         } else {
             const uint64_t ft_w0 = PS3_FT_ON() ? ps3_ft_now() : 0;
+            const uint64_t ws_w0 = mach_absolute_time();
             [cb commit];
             [cb waitUntilCompleted];
+            if (ws_on()) {
+                const u32 rsn = s_ft_flush_reason < 4 ? s_ft_flush_reason : 4;
+                s_ws_sync_ms[rsn] += ws_ms(ws_w0, mach_absolute_time());
+                s_ws_sync_n[rsn]++;
+            }
             if (ft_w0) {
                 const uint64_t w1 = ps3_ft_now();
                 ps3_ft_span(PS3_FT_GPU_WAIT, 0, present_dst ? 1u : 0u,
@@ -7387,6 +7537,8 @@ static void eng_present(void* user, u32 surface)
         const float os = s_eng_scale;
         eng_read_scale();
         if (s_eng_scale != os) eng_rescale();
+        else fprintf(stderr, "[RSX metal] display settings applied: internal resolution x%.2f (%ux%u), unchanged\n",
+                     (double)s_eng_scale, sc_dim(s_width), sc_dim(s_height));
     }
 }
 
@@ -7414,9 +7566,11 @@ static void eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
     /* Diagnostics only (present log, trace triggers, surface dumps): wait for
      * the GPU so the bytes are the frame just submitted, not a stale one. */
     if (s_queue) {
+        const uint64_t r0 = mach_absolute_time();
         id<MTLCommandBuffer> fence = [s_queue commandBuffer];
         [fence commit];
         [fence waitUntilCompleted];
+        if (ws_on()) { s_ws_readback_ms += ws_ms(r0, mach_absolute_time()); s_ws_readback_n++; }
     }
     if (!scaled) {
         [t getBytes:out bytesPerRow:out_pitch
@@ -7453,6 +7607,7 @@ static const rsx_draw_backend s_engine_backend = {
     .init                 = eng_init,
     .shutdown             = eng_shutdown,
     .submit_and_wait      = eng_submit_and_wait,
+    .query_fence_async    = eng_query_fence_async,
     .texture_create       = eng_texture_create,
     .texture_upload       = eng_texture_upload,
     .texture_release      = eng_obj_release,

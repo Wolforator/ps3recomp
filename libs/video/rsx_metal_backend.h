@@ -57,6 +57,9 @@ int  rsx_metal_backend_window_focused(void);
  * (none: headless), and whether the app is in front (the window's focus). */
 void rsx_metal_backend_ios_attach(void* layer);
 void rsx_metal_backend_ios_set_active(int active);
+/* iOS only: the frame rate cap's interval (1/60, 1/30), 0 for none: each
+ * frame is presented to stay up at least that long (a 120 Hz screen). */
+void rsx_metal_backend_set_min_frame_interval(double seconds);
 /* The mouse's buttons while the cursor is held for a port (rsx_host_mouse.h,
  * which this backend implements for its window): 0 left, 1 right, 2 middle,
  * then the others in the device's order. */
